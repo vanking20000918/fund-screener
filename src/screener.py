@@ -39,10 +39,10 @@ def get_candidate_pool():
         if df1 is not None and len(df1) > 0:
             df1['基金类型'] = '股票型'
             pieces.append(df1)
-    if '混合型-偏股' in FUND_TYPES:
+    if '混合型' in FUND_TYPES:
         df2 = df_module.fetch_fund_rank_mixed()
         if df2 is not None and len(df2) > 0:
-            df2['基金类型'] = '偏股混合型'
+            df2['基金类型'] = '混合型'
             pieces.append(df2)
 
     if not pieces:

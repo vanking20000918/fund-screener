@@ -95,9 +95,9 @@ def fetch_fund_rank_stock():
 
 @cache_result('fund_rank_mixed.pkl', days=CACHE_DAYS_RANK)
 def fetch_fund_rank_mixed():
-    """混合型-偏股基金排名"""
-    logger.info('拉取偏股混合型基金排名...')
-    df = ak.fund_open_fund_rank_em(symbol="混合型-偏股")
+    """混合型基金排名"""
+    logger.info('拉取混合型基金排名...')
+    df = ak.fund_open_fund_rank_em(symbol="混合型")
     return df
 
 
