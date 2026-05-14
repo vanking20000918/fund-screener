@@ -190,6 +190,13 @@ def fetch_fund_rank_mixed():
     return _fetch_fund_rank_raw('hh')
 
 
+@cache_result('em_fund_rank_qdii.pkl', days=CACHE_DAYS_RANK)
+def fetch_fund_rank_qdii():
+    """QDII基金排名"""
+    logger.info('[天天基金] 拉取QDII基金排名...')
+    return _fetch_fund_rank_raw('qdii')
+
+
 # ============================================================================
 # 基金净值数据
 # ============================================================================

@@ -51,6 +51,11 @@ def get_candidate_pool():
         if df2 is not None and len(df2) > 0:
             df2['基金类型'] = '混合型'
             pieces.append(df2)
+    if 'QDII' in FUND_TYPES:
+        df3 = df_module.fetch_fund_rank_qdii()
+        if df3 is not None and len(df3) > 0:
+            df3['基金类型'] = 'QDII'
+            pieces.append(df3)
 
     if not pieces:
         logger.error('未获取到任何基金排名数据')

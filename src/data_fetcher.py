@@ -101,6 +101,14 @@ def fetch_fund_rank_mixed():
     return df
 
 
+@cache_result('fund_rank_qdii.pkl', days=CACHE_DAYS_RANK)
+def fetch_fund_rank_qdii():
+    """QDII基金排名"""
+    logger.info('拉取QDII基金排名...')
+    df = ak.fund_open_fund_rank_em(symbol="QDII")
+    return df
+
+
 @cache_result('fund_basics.pkl', days=CACHE_DAYS_RANK)
 def fetch_all_fund_basics():
     """所有基金的基本信息(代码、名称、类型)"""
