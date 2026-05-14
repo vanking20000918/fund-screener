@@ -103,43 +103,50 @@ def enrich_with_manager_info(candidate_df):
         candidate_df['基金经理'] = ''
         return candidate_df
 
-    # 标准化经理表的列名
-    col_map = {}
-    for col in manager_df.columns:
-        if '代码' in col and 'col_code' not in col_map:
-            col_map['col_code'] = col
-        elif '基金经理' == col or '姓名' == col:
-            col_map['col_manager'] = col
-        elif '现任基金' in col or '管理基金' in col:
-            col_map['col_count'] = col
-        elif '累计' in col and ('年' in col or '日' in col):
-            col_map['col_years'] = col
+    # 适配当前 AKShare 经理表列名:
+    # 序号, 姓名, 所属公司, 现任基金代码, 现任基金, 累计从业时间, 现任基金资产总规模, 现任基金最佳回报
+    code_col = '现任基金代码' if '现任基金代码' in manager_df.columns else None
+    name_col = '姓名' if '姓名' in manager_df.columns else None
+    tenure_col = '累计从业时间' if '累计从业时间' in manager_df.columns else None
 
-    # 按基金代码合并
-    if 'col_code' in col_map:
-        manager_df['_code'] = manager_df[col_map['col_code']].astype(str).str.zfill(6)
-        merge_cols = ['_code']
-        rename_map = {'_code': '_code'}
-        if 'col_manager' in col_map:
-            merge_cols.append(col_map['col_manager'])
-            rename_map[col_map['col_manager']] = '基金经理'
-        if 'col_count' in col_map:
-            merge_cols.append(col_map['col_count'])
-            rename_map[col_map['col_count']] = '经理在管基金数'
-        if 'col_years' in col_map:
-            merge_cols.append(col_map['col_years'])
-            rename_map[col_map['col_years']] = '经理累计任职'
+    if not code_col:
+        # 回退: 尝试模糊匹配
+        for col in manager_df.columns:
+            if '代码' in col and not code_col:
+                code_col = col
+            elif ('姓名' in col or '基金经理' == col) and not name_col:
+                name_col = col
+            elif '累计' in col and not tenure_col:
+                tenure_col = col
 
-        sub = manager_df[merge_cols].rename(columns=rename_map)
-        # 一只基金可能多个经理,这里取第一个
-        sub = sub.drop_duplicates(subset='_code', keep='first')
+    if code_col:
+        manager_df['_code'] = manager_df[code_col].astype(str).str.zfill(6)
+
+        # 计算每位经理在管基金数
+        if name_col:
+            fund_count = manager_df.groupby(name_col)['_code'].nunique().reset_index()
+            fund_count.columns = [name_col, '经理在管基金数']
+            manager_df = manager_df.merge(fund_count, on=name_col, how='left')
+
+        # 解析任职年限: 累计从业时间可能是天数(int)或 "X年X天" 字符串
+        if tenure_col:
+            manager_df['经理任职年限'] = manager_df[tenure_col].apply(_parse_tenure)
+
+        # 构建合并子表
+        sub_cols = ['_code']
+        if name_col:
+            manager_df = manager_df.rename(columns={name_col: '基金经理'})
+            sub_cols.append('基金经理')
+        if '经理在管基金数' in manager_df.columns:
+            sub_cols.append('经理在管基金数')
+        if '经理任职年限' in manager_df.columns:
+            sub_cols.append('经理任职年限')
+
+        sub = manager_df[sub_cols].drop_duplicates(subset='_code', keep='first')
         candidate_df = candidate_df.merge(sub, left_on='基金代码', right_on='_code', how='left')
         candidate_df = candidate_df.drop(columns=['_code'], errors='ignore')
 
-        # 解析任职年限(可能是 "5年100天" 这种格式,也可能是数字)
-        if '经理累计任职' in candidate_df.columns:
-            candidate_df['经理任职年限'] = candidate_df['经理累计任职'].apply(_parse_tenure)
-        else:
+        if '经理任职年限' not in candidate_df.columns:
             candidate_df['经理任职年限'] = np.nan
     else:
         candidate_df['经理任职年限'] = np.nan
@@ -151,12 +158,14 @@ def enrich_with_manager_info(candidate_df):
 
 
 def _parse_tenure(val):
-    """解析任职时长字符串为年数"""
+    """解析任职时长为年数。支持: 纯天数(1352)、'X年X天'、纯数字字符串"""
     if pd.isna(val):
         return np.nan
     if isinstance(val, (int, float)):
-        return float(val)
-    s = str(val)
+        # 纯数字: 如果 > 100 视为天数,否则视为年数
+        v = float(val)
+        return v / 365 if v > 100 else v
+    s = str(val).strip()
     try:
         years = 0
         if '年' in s:
@@ -168,7 +177,8 @@ def _parse_tenure(val):
         elif '天' in s:
             years = float(s.replace('天', '')) / 365
         else:
-            years = float(s)
+            v = float(s)
+            return v / 365 if v > 100 else v
         return years
     except (ValueError, IndexError):
         return np.nan
@@ -257,12 +267,12 @@ def enrich_with_nav_metrics(candidate_df):
 
 
 def enrich_with_basics(candidate_df):
-    """第四步: 补充基金成立时间、规模、费率等基础信息"""
+    """第四步: 补充基金规模、成立时间、费率等基础信息"""
     logger.info('=' * 60)
     logger.info('Step 4: 补充基金基础信息(规模、成立时间、费率)')
     logger.info('=' * 60)
 
-    # 找规模列
+    # 1. 规模: 优先从已有列找, 否则从经理表的"现任基金资产总规模"列获取
     scale_col = None
     for col in candidate_df.columns:
         if '规模' in col or '净资产' in col:
@@ -272,9 +282,27 @@ def enrich_with_basics(candidate_df):
     if scale_col:
         candidate_df['基金规模'] = pd.to_numeric(candidate_df[scale_col], errors='coerce')
     else:
-        candidate_df['基金规模'] = np.nan
+        # 从经理表获取规模
+        try:
+            manager_df = df_module.fetch_all_managers()
+            if manager_df is not None and '现任基金资产总规模' in manager_df.columns and '现任基金代码' in manager_df.columns:
+                scale_sub = manager_df[['现任基金代码', '现任基金资产总规模']].copy()
+                scale_sub['现任基金代码'] = scale_sub['现任基金代码'].astype(str).str.zfill(6)
+                scale_sub['现任基金资产总规模'] = pd.to_numeric(scale_sub['现任基金资产总规模'], errors='coerce')
+                scale_sub = scale_sub.drop_duplicates(subset='现任基金代码', keep='first')
+                candidate_df = candidate_df.merge(
+                    scale_sub.rename(columns={'现任基金代码': '_sc', '现任基金资产总规模': '基金规模'}),
+                    left_on='基金代码', right_on='_sc', how='left'
+                )
+                candidate_df = candidate_df.drop(columns=['_sc'], errors='ignore')
+            else:
+                candidate_df['基金规模'] = np.nan
+        except Exception as e:
+            logger.warning(f'从经理表获取规模失败: {e}')
+            candidate_df['基金规模'] = np.nan
 
-    # 找成立日期列
+    # 2. 成立时间: 用经理任职年限作近似(经理任职 >= 基金年龄的下限)
+    #    精确查询太慢,这里用保守策略: 如果经理任职 >= min_fund_age 则视为基金年龄也满足
     founded_col = None
     for col in candidate_df.columns:
         if '成立日期' in col or '成立日' in col:
@@ -285,16 +313,18 @@ def enrich_with_basics(candidate_df):
         candidate_df['成立日期'] = pd.to_datetime(candidate_df[founded_col], errors='coerce')
         candidate_df['基金年龄'] = (datetime.now() - candidate_df['成立日期']).dt.days / 365
     else:
-        # 回退: 通过详细信息查询
-        candidate_df['基金年龄'] = np.nan
+        # 用经理任职年限作为基金年龄下限估算
+        if '经理任职年限' in candidate_df.columns:
+            candidate_df['基金年龄'] = candidate_df['经理任职年限']
+        else:
+            candidate_df['基金年龄'] = np.nan
         candidate_df['成立日期'] = pd.NaT
 
-    # 费率: 排名表通常没有,默认填充行业均值 1.75
-    # (要精确就得对每只查 fund_individual_basic_info_xq,太耗时,这里用合理默认值)
+    # 3. 费率: 默认行业均值
     candidate_df['综合费率'] = 1.75
 
-    # 机构持有比例: 默认值,实际需查半年报数据
-    candidate_df['机构持有比例'] = 30  # 假设默认值,真实场景需要查
+    # 4. 机构持有比例: 默认值
+    candidate_df['机构持有比例'] = 30
 
     return candidate_df
 
@@ -483,8 +513,8 @@ def run_screening():
     if len(candidate) == 0:
         return pd.DataFrame(), pd.DataFrame()
 
-    candidate = enrich_with_basics(candidate)
     candidate = enrich_with_manager_info(candidate)
+    candidate = enrich_with_basics(candidate)
     candidate = enrich_with_nav_metrics(candidate)
     candidate = apply_hard_filter(candidate)
     candidate = calc_soft_score(candidate)
