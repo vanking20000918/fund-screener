@@ -1,0 +1,53 @@
+name: Monthly Fund Report
+
+on:
+  # 每月28-31号 UTC 10:00 (北京时间18:00) 触发
+  schedule:
+    - cron: '0 10 28-31 * *'
+  # 支持手动触发(用于测试)
+  workflow_dispatch:
+
+jobs:
+  screen-and-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Check if last day of month
+        id: check_date
+        run: |
+          # 判断今天是否是本月最后一天
+          # workflow_dispatch 手动触发时跳过此检查
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "is_last_day=true" >> $GITHUB_OUTPUT
+            echo "手动触发,跳过日期检查"
+          else
+            tomorrow=$(date -d "+1 day" +%m)
+            today=$(date +%m)
+            if [ "$tomorrow" != "$today" ]; then
+              echo "is_last_day=true" >> $GITHUB_OUTPUT
+              echo "今天是本月最后一天,开始执行"
+            else
+              echo "is_last_day=false" >> $GITHUB_OUTPUT
+              echo "今天不是本月最后一天,跳过"
+            fi
+          fi
+
+      - name: Run fund screener
+        if: steps.check_date.outputs.is_last_day == 'true'
+        env:
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
+        run: python main.py
