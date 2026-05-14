@@ -1,7 +1,7 @@
 """
 筛选与评分主逻辑
 流程:
-1. 拉取全市场主动股票+偏股混合基金排名
+1. 拉取全市场股票型+混合型+QDII基金排名
 2. 应用初步过滤(规模、收益率排名)缩小候选池
 3. 对候选池获取详细数据(净值、经理信息、持仓)
 4. 应用 6 项硬性筛选
@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 def get_candidate_pool():
     """
     第一步: 获取候选池
-    合并主动股票型+偏股混合型,做初步过滤
+    合并股票型+混合型+QDII,做初步过滤
     """
     logger.info('=' * 60)
     logger.info('Step 1: 获取候选池')
@@ -62,7 +62,7 @@ def get_candidate_pool():
         return pd.DataFrame()
 
     df = pd.concat(pieces, ignore_index=True)
-    logger.info(f'全市场主动权益基金合计: {len(df)} 只')
+    logger.info(f'全市场基金合计: {len(df)} 只')
 
     # 标准化列名
     if '基金代码' not in df.columns:

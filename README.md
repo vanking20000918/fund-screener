@@ -1,37 +1,39 @@
 # 主动基金月度筛选机器人
 
-每月底自动筛选 A 股主动股票型 + 偏股混合型基金,推荐前 10 名,通过邮件发送到指定邮箱。
+每月底自动筛选 A 股主动股票型 + 混合型 + QDII 基金,推荐前 20 名,通过邮件发送到指定邮箱。
 
-## 🎯 它做什么
+## 它做什么
 
-1. 从 AKShare 拉取全市场主动权益基金数据
-2. 应用 **6 项硬性筛选**(经理任职年限、规模、回撤等)
-3. 计算 **7 维度软性评分**(业绩稳定性、夏普、熊市表现等)
-4. 加权排序,输出 Top 10 推荐
-5. 生成 HTML 邮件正文 + Excel 详细附件
-6. 通过 QQ 邮箱 SMTP 发送到你的邮箱
+1. 从天天基金网拉取全市场基金数据(股票型 + 混合型 + QDII)
+2. 按近 3 年收益率排序,取前 300 只进入详细分析
+3. 应用 **6 项硬性筛选**(经理任职年限、规模、回撤等)
+4. 计算 **7 维度软性评分**(业绩稳定性、夏普、熊市表现等)
+5. 加权排序,输出 Top 20 推荐
+6. 生成 HTML 邮件正文 + Excel 详细附件(含 300 只候选池完整数据)
+7. 通过 QQ 邮箱 SMTP 发送到你的邮箱
 
-## 📁 项目结构
+## 项目结构
 
 ```
 fund_screener/
 ├── .github/workflows/
-│   └── monthly_report.yml      # GitHub Actions 定时任务配置
+│   └── monthly_report.yml          # GitHub Actions 定时任务配置
 ├── src/
 │   ├── __init__.py
-│   ├── config.py               # 所有可调参数
-│   ├── data_fetcher.py         # AKShare 数据获取(含缓存与重试)
-│   ├── metrics.py              # 指标计算(回撤、夏普、熊市数等)
-│   ├── screener.py             # 筛选与评分主逻辑
-│   ├── report_generator.py     # HTML + Excel 报告生成
-│   └── mail_sender.py          # QQ 邮箱 SMTP 发送
-├── main.py                     # 主入口
-├── requirements.txt            # Python 依赖
+│   ├── config.py                   # 所有可调参数
+│   ├── data_fetcher.py             # AKShare 数据获取(备用数据源)
+│   ├── data_fetcher_eastmoney.py   # 天天基金网直接爬取(默认数据源)
+│   ├── metrics.py                  # 指标计算(回撤、夏普、熊市数等)
+│   ├── screener.py                 # 筛选与评分主逻辑
+│   ├── report_generator.py         # HTML + Excel 报告生成
+│   └── mail_sender.py              # QQ 邮箱 SMTP 发送
+├── main.py                         # 主入口
+├── requirements.txt                # Python 依赖
 ├── .gitignore
-└── README.md                   # 本文件
+└── README.md                       # 本文件
 ```
 
-## 🚀 部署步骤(GitHub Actions 方案)
+## 部署步骤(GitHub Actions 方案)
 
 ### 第 1 步:准备 GitHub 仓库
 
@@ -39,7 +41,6 @@ fund_screener/
 2. 把本项目所有文件上传到该仓库
 
 ```bash
-# 在本地命令行中
 cd fund_screener
 git init
 git add .
@@ -83,8 +84,8 @@ git push -u origin main
 1. 进入 **Actions** 标签页
 2. 点击左侧 "Monthly Fund Report"
 3. 右上角 **"Run workflow"** → 选择 `main` 分支 → **Run workflow**
-4. 等待运行结束(首次约 15-25 分钟)
-5. 查看 1793031400@qq.com 邮箱是否收到报告
+4. 等待运行结束(约 10-20 分钟)
+5. 查看邮箱是否收到报告
 
 ### 第 6 步:确认定时调度
 
@@ -92,11 +93,17 @@ git push -u origin main
 - 脚本会在 GitHub Actions 中先判断**今天是否本月最后一天**,只在月末实际跑
 - 这样能保证每个月只执行 1 次,不会浪费 GitHub 免费额度
 
-## 🔧 配置调整
+## 配置调整
 
 打开 `src/config.py`,可修改:
 
 ```python
+# 数据源切换
+DATA_SOURCE = 'eastmoney'  # 'eastmoney' (天天基金网) 或 'akshare' (AKShare库)
+
+# 筛选范围
+FUND_TYPES = ['股票型', '混合型', 'QDII']
+
 # 硬性筛选阈值
 HARD_FILTER = {
     'min_manager_years': 5,        # 经理任职年限要求,默认5年
@@ -115,18 +122,16 @@ SCORE_WEIGHTS = {
 }
 
 # 输出数量
-TOP_N = 10              # 改成 20 就推荐前 20 名
+TOP_N = 20              # 推荐前 20 名
 
 # 候选池大小
 PERF_CONFIG = {
-    'candidate_pool_size': 150,    # 详细分析的基金数量,越大越慢
+    'candidate_pool_size': 300,    # 详细分析的基金数量,越大越慢
     ...
 }
 ```
 
-## 💻 本地测试运行
-
-如果你想先在本地跑通一遍再上传:
+## 本地测试运行
 
 ```bash
 # 1. 安装依赖
@@ -148,11 +153,20 @@ $env:EMAIL_PASSWORD = "授权码"
 python main.py
 ```
 
-## ⚠️ 已知限制与注意事项
+## 已知限制与注意事项
 
-### 1. 数据精度限制
+### 1. 数据源
 
-由于 AKShare 是公开接口,有几项指标用了**估算值或代理指标**:
+默认使用**天天基金网**直接爬取,也可切换为 AKShare(设置 `DATA_SOURCE = 'akshare'`)。
+
+天天基金网数据获取方式:
+- 排名数据: 一次请求获取全部基金排名
+- 净值数据: `pingzhongdata` 接口一次请求获取全部历史净值
+- 详情数据: 逐只爬取基金经理、规模、成立日期
+
+### 2. 数据精度限制
+
+有几项指标用了**估算值或代理指标**:
 
 | 指标 | 实际做法 | 影响 |
 |---|---|---|
@@ -161,24 +175,18 @@ python main.py
 | 风格一致性 | 用波动率作代理 | 与持仓行业偏离度不完全等价 |
 | 投资框架 | 用夏普比率作代理 | 主观维度难以完全量化 |
 
-**结论**: 本工具是**初筛工具**,出来的 Top 10 应该结合人工核查再做决策。
-
-### 2. AKShare 数据源稳定性
-
-- 高频请求可能被限流,本项目已设置 0.3 秒/次的延迟
-- 数据接口偶尔会改版,如出错请 `pip install -U akshare` 升级
-- 首次运行约 15-25 分钟,后续有缓存加速
+**结论**: 本工具是**初筛工具**,出来的 Top 20 应该结合人工核查再做决策。
 
 ### 3. GitHub Actions 免费额度
 
-- 免费账户每月 2000 分钟,本项目每次运行约 20 分钟,完全够用
+- 免费账户每月 2000 分钟,本项目每次运行约 10-20 分钟,完全够用
 - 私有仓库才占用配额,公有仓库不限
 
 ### 4. 月末日期处理
 
 代码用了"今天的明天月份不同 = 今天是月末"的判断方式,可正确识别 28/29/30/31 号。
 
-## 🐛 故障排查
+## 故障排查
 
 ### 邮件没收到
 
@@ -191,24 +199,19 @@ python main.py
 - 99% 是把 QQ 登录密码当成了授权码,请重新生成
 - 或者授权码失效,请重新申请
 
-### 报错 `akshare 接口不可用`
+### Top 20 数量不足
 
-- 升级 akshare: 在 `requirements.txt` 里把版本号改成 `akshare>=最新版`
-- 推到 GitHub 触发重新安装
-
-### Top 10 数量不足
-
-- 当月通过硬筛的基金不够 10 只,这很正常
+- 当月通过硬筛的基金不够 20 只,这很正常
 - 可在 `config.py` 适当放宽 `HARD_FILTER` 阈值
 
-## 📝 后续可扩展方向
+## 后续可扩展方向
 
 - 加入持仓相似度分析,避免推荐风格重复的基金
 - 加入业绩归因(因子暴露)分析
 - 增加因子(动量、价值、质量)轮动维度
-- 加入跌幅自动提醒(配合你的定投策略)
+- 加入跌幅自动提醒(配合定投策略)
 - 把月度报告同步到 Notion / 飞书 / Telegram
 
-## 📄 License
+## License
 
 MIT License — 自由使用,但不对任何投资损失负责。

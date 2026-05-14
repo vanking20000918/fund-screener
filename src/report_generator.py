@@ -1,7 +1,7 @@
 """
 报告生成模块
-1. HTML 邮件正文(Top 10 列表+评分+各指标明细)
-2. Excel 附件(完整详细数据)
+1. HTML 邮件正文(Top N 推荐列表+评分+各指标明细)
+2. Excel 附件(完整候选池详细数据)
 """
 import os
 import logging
@@ -53,7 +53,7 @@ HTML_TEMPLATE = """
 
     <div class="summary-box">
         <strong>📌 本期摘要</strong><br>
-        • 候选池规模: <strong>{candidate_count}</strong> 只(主动股票型 + 偏股混合型)<br>
+        • 候选池规模: <strong>{candidate_count}</strong> 只(股票型 + 混合型 + QDII)<br>
         • 通过硬性筛选: <strong>{passed_count}</strong> 只<br>
         • 推荐 Top {top_n} 平均得分: <strong>{avg_score:.1f}</strong><br>
         • A 级数量: {a_count}; B 级数量: {b_count}
@@ -125,7 +125,7 @@ HTML_TEMPLATE = """
     </div>
 
     <div class="footer">
-        本报告由自动化脚本生成 · 数据来源: AKShare 公开接口 · 评分卡 v1.0<br>
+        本报告由自动化脚本生成 · 数据来源: 天天基金网 · 评分卡 v1.0<br>
         如需调整筛选参数,请修改 src/config.py
     </div>
 </body>
