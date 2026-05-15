@@ -93,6 +93,20 @@ def get_candidate_pool():
 
     df['基金代码'] = df['基金代码'].astype(str).str.zfill(6)
 
+    # 预过滤: 仅保留成立 ≥ min_fund_age 年的基金, 避免新基金"成立以来"收益挤占候选池
+    # (eastmoney 对新基金的 近3年 列实为"成立以来"收益, 不预过滤会导致硬筛阶段全军覆没)
+    founded_col = _find_col(df, '成立日期') or _find_col(df, '成立日')
+    if founded_col:
+        from .config import HARD_FILTER as _HF
+        min_age = _HF.get('min_fund_age', 3)
+        df['_founded'] = pd.to_datetime(df[founded_col], errors='coerce')
+        cutoff = pd.Timestamp.now() - pd.Timedelta(days=int(365 * min_age))
+        n_before = len(df)
+        # 成立日期缺失的基金保留(由后续硬筛处理), 仅过滤掉确认 < min_age 年的
+        keep_mask = df['_founded'].isna() | (df['_founded'] <= cutoff)
+        df = df[keep_mask].copy().drop(columns=['_founded'])
+        logger.info(f'按成立日期 ≥ {min_age} 年预过滤: {n_before} → {len(df)} 只')
+
     # 找各期收益列(eastmoney 列名: 近1年/近3年/今年来; akshare 类似)
     col_3y = _find_col(df, '近3年')
     col_1y = _find_col(df, '近1年')
@@ -108,6 +122,7 @@ def get_candidate_pool():
         logger.info(f'已缓存全市场近3年收益 {len(_FULL_MARKET_REF["rank_3y"])} 条作为分位参考')
 
     # 综合排名: 各期收益分位加权
+    # NaN 值: 显式 fillna(0) 以避免数据缺失被排到"最好"(bug fix)
     composite_score = pd.Series(0.0, index=df.index)
     weight_used = 0.0
     label_map = {'近3年': col_3y, '近1年': col_1y, '今年来': col_ytd}
@@ -115,7 +130,7 @@ def get_candidate_pool():
         w = POOL_RANK_WEIGHTS.get(label, 0)
         if col is None or w == 0:
             continue
-        rank_pct = df[col].rank(ascending=True, pct=True, na_option='bottom')
+        rank_pct = df[col].rank(ascending=True, pct=True, na_option='keep').fillna(0)
         composite_score = composite_score + rank_pct * w
         weight_used += w
 
@@ -505,6 +520,22 @@ def apply_hard_filter(df):
 
     hf = HARD_FILTER
 
+    # 数据完整度诊断
+    logger.info('硬筛输入数据完整度 (有效/总数, 数值列含 min/median/max):')
+    for col in ['经理任职年限', '基金年龄', '基金规模', '经理在管基金数', '近3年最大回撤', '近1年收益率']:
+        if col not in df.columns:
+            logger.info(f'  {col}: 列不存在 (该项硬筛将跳过)')
+            continue
+        series = pd.to_numeric(df[col], errors='coerce')
+        valid = series.notna().sum()
+        if valid > 0:
+            logger.info(
+                f'  {col}: {valid}/{len(df)} 有效, '
+                f'min={series.min():.2f} median={series.median():.2f} max={series.max():.2f}'
+            )
+        else:
+            logger.info(f'  {col}: 0/{len(df)} 全部 NaN (该项硬筛将全部放行)')
+
     def _fail(mask, reason):
         df.loc[mask, '硬筛通过'] = False
         df.loc[mask, '淘汰原因'] = df.loc[mask, '淘汰原因'] + reason + ';'
@@ -551,6 +582,19 @@ def apply_hard_filter(df):
 
     passed = df['硬筛通过'].sum()
     logger.info(f'硬筛结果: {n0} 只 → {passed} 只通过')
+
+    # 淘汰原因统计 (一只基金可能因多条规则淘汰, 各条都计数)
+    failed_df = df[~df['硬筛通过']]
+    if len(failed_df) > 0:
+        reason_counts = {}
+        for r in failed_df['淘汰原因']:
+            for reason in r.rstrip(';').split(';'):
+                reason = reason.strip()
+                if reason:
+                    reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        logger.info('硬筛淘汰原因 Top:')
+        for reason, n in sorted(reason_counts.items(), key=lambda x: -x[1]):
+            logger.info(f'  {reason}: {n} 只')
     return df
 
 
