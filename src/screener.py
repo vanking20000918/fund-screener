@@ -42,6 +42,8 @@ def _find_col(df, *keywords):
 # 模块级缓存,供软评分阶段引用全市场参考数据
 _FULL_MARKET_REF = {
     'rank_3y': None,    # 全市场近3年收益率(去 NaN), 用于 stability 全市场分位
+    'rank_1y': None,    # 兜底: 近1年收益分位
+    'rank_ytd': None,   # 兜底: 今年来收益分位
 }
 
 
@@ -116,10 +118,18 @@ def get_candidate_pool():
         if c:
             df[c] = pd.to_numeric(df[c], errors='coerce')
 
-    # 缓存全市场近3年收益, 用于软评分 stability 全市场分位
+    # 缓存全市场各期收益, 供软评分 stability 分位计算 (近3年优先, 近1年/今年来 兜底)
     if col_3y:
         _FULL_MARKET_REF['rank_3y'] = df[col_3y].dropna().tolist()
-        logger.info(f'已缓存全市场近3年收益 {len(_FULL_MARKET_REF["rank_3y"])} 条作为分位参考')
+    if col_1y:
+        _FULL_MARKET_REF['rank_1y'] = df[col_1y].dropna().tolist()
+    if col_ytd:
+        _FULL_MARKET_REF['rank_ytd'] = df[col_ytd].dropna().tolist()
+    logger.info(
+        f'全市场参考分位样本数: 近3年={len(_FULL_MARKET_REF["rank_3y"] or [])}, '
+        f'近1年={len(_FULL_MARKET_REF["rank_1y"] or [])}, '
+        f'今年来={len(_FULL_MARKET_REF["rank_ytd"] or [])}'
+    )
 
     # 综合排名: 各期收益分位加权
     # NaN 值: 显式 fillna(0) 以避免数据缺失被排到"最好"(bug fix)
@@ -373,23 +383,34 @@ def enrich_with_nav_metrics(candidate_df):
     metrics_df = pd.DataFrame(results)
     candidate_df = candidate_df.merge(metrics_df, on='基金代码', how='left')
 
-    # 业绩排名分位: 优先全市场近3年分位, 退化为候选池年度分位
-    logger.info('计算业绩排名分位 (全市场参考)...')
-    full_3y_returns = _FULL_MARKET_REF.get('rank_3y') or []
+    # 业绩排名分位: 多层兜底 近3年→近1年→今年来→池内年度分位
+    logger.info('计算业绩排名分位 (多层兜底全市场参考)...')
     rank_3y_col = _find_col(candidate_df, '近3年')
+    rank_1y_col = _find_col(candidate_df, '近1年')
+    rank_ytd_col = _find_col(candidate_df, '今年来') or _find_col(candidate_df, '今年')
+
+    fallback_chain = [
+        ('近3年', rank_3y_col, _FULL_MARKET_REF.get('rank_3y') or []),
+        ('近1年', rank_1y_col, _FULL_MARKET_REF.get('rank_1y') or []),
+        ('今年来', rank_ytd_col, _FULL_MARKET_REF.get('rank_ytd') or []),
+    ]
 
     def _stability_percentile(row):
-        if rank_3y_col and full_3y_returns:
-            val = pd.to_numeric(row.get(rank_3y_col), errors='coerce')
-            p = metrics.calc_market_percentile(val, full_3y_returns)
-            if pd.notna(p):
-                return p
+        for _label, col_name, ref in fallback_chain:
+            if col_name and ref:
+                val = pd.to_numeric(row.get(col_name), errors='coerce')
+                p = metrics.calc_market_percentile(val, ref)
+                if pd.notna(p):
+                    return p
+        # 最后回退到池内年度分位
         ar = row.get('年度收益', [])
         if ar:
             return metrics.calc_performance_rank_percentile(ar, annual_returns_pool)
         return np.nan
 
     candidate_df['业绩排名分位'] = candidate_df.apply(_stability_percentile, axis=1)
+    valid_n = candidate_df['业绩排名分位'].notna().sum()
+    logger.info(f'业绩排名分位有效数: {valid_n}/{len(candidate_df)}')
     return candidate_df
 
 

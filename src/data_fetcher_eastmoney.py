@@ -321,3 +321,76 @@ def fetch_fund_details_batch(codes):
         if (i + 1) % 30 == 0:
             logger.info(f'  详情进度: {i+1}/{len(codes)}')
     return pd.DataFrame(results) if results else pd.DataFrame()
+
+
+# ============================================================================
+# 行业配置(用于"风格一致性"评分维度)
+# ============================================================================
+
+@retry()
+def fetch_recent_industry_allocations(code, years=2):
+    """
+    从天天基金 API 获取近 N 年的行业配置历史
+    返回 list of dict [{industry: weight, ...}, ...] (按期排序, 老→新)
+    数据缺失或解析失败返回 []
+    """
+    time.sleep(PERF_CONFIG['request_delay'])
+
+    url = 'https://api.fund.eastmoney.com/f10/HYPZ/'
+    params = {
+        'fundCode': code,
+        'OSVersion': '14.3',
+        'deviceid': 'Wap',
+    }
+    headers = {
+        'User-Agent': HEADERS['User-Agent'],
+        'Referer': f'https://fundf10.eastmoney.com/hytz_{code}.html',
+        'Accept': '*/*',
+    }
+
+    try:
+        resp = requests.get(url, params=params, headers=headers, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logger.debug(f'  基金 {code} 行业配置 API 失败: {e}')
+        return []
+
+    if not isinstance(data, dict):
+        return []
+    if data.get('ErrCode') not in (0, None, '0'):
+        return []
+
+    detail = (data.get('Data') or {}).get('HYPZDetail') or []
+    if not detail:
+        return []
+
+    # 取最近 years*2 期 (每年大约 2 期: 中报+年报)
+    max_periods = max(2, years * 2)
+    out = []
+    for period in detail[:max_periods]:
+        industries = (period.get('FundIndustry')
+                      or period.get('Industries')
+                      or period.get('HYPZ')
+                      or [])
+        if not industries:
+            continue
+
+        alloc = {}
+        for item in industries:
+            if not isinstance(item, dict):
+                continue
+            name = (item.get('HYMC') or item.get('Industry') or item.get('HYDM') or '').strip()
+            weight_raw = (item.get('ZJZBL') or item.get('JZBL')
+                          or item.get('Weight') or item.get('NetValueRatio') or '0')
+            try:
+                w = float(str(weight_raw).replace('%', '').strip()) if weight_raw else 0
+            except (ValueError, TypeError):
+                continue
+            if name and w > 0:
+                alloc[name] = alloc.get(name, 0.0) + w
+        if alloc:
+            out.append(alloc)
+
+    out.reverse()  # API 返回新→老, 反转为 老→新
+    return out

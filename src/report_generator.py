@@ -156,6 +156,17 @@ def _fmt(val, fmt='{:.2f}', default='—'):
         return str(val)
 
 
+def _fmt_bear_dd(row):
+    """熊市平均回撤显示: NaN 且熊市数=0 时显示'未经历熊市',否则显示'—'"""
+    dd = row.get('熊市平均回撤')
+    if pd.notna(dd):
+        return f'{dd:.1f}'
+    bc = row.get('熊市数', 0)
+    if pd.isna(bc):
+        bc = 0
+    return '未经历熊市' if int(bc) == 0 else '—'
+
+
 def generate_html_report(top_n_df, all_df):
     """生成 HTML 邮件正文"""
     if len(top_n_df) == 0:
@@ -200,7 +211,7 @@ def generate_html_report(top_n_df, all_df):
                 <td>{_fmt(row.get('卡玛比率'), '{:.2f}')}</td>
                 <td>{_fmt(row.get('年化波动率'), '{:.1f}')}</td>
                 <td>{_fmt(row.get('业绩排名分位'), '{:.0f}')}</td>
-                <td>{_fmt(row.get('熊市平均回撤'), '{:.1f}')}</td>
+                <td>{_fmt_bear_dd(row)}</td>
                 <td>{_fmt(row.get('行业稳定性'), '{:.2f}')}</td>
             </tr>
         """)
@@ -310,7 +321,13 @@ def generate_excel_report(top_n_df, all_df, output_path):
         ws_top.cell(row=i, column=1, value=i - 4)
         for j, col in enumerate(top_cols[1:], 2):
             val = row.get(col, '')
-            if pd.isna(val):
+            # 熊市平均回撤 NaN 时给出温柔提示
+            if col == '熊市平均回撤' and pd.isna(val):
+                bc = row.get('熊市数', 0)
+                if pd.isna(bc):
+                    bc = 0
+                val = '未经历熊市' if int(bc) == 0 else ''
+            elif pd.isna(val):
                 val = ''
             cell = ws_top.cell(row=i, column=j, value=val)
             cell.font = F_BODY
@@ -373,7 +390,12 @@ def generate_excel_report(top_n_df, all_df, output_path):
     for i, (_, row) in enumerate(sorted_all.iterrows(), start=4):
         for j, col in enumerate(all_cols, 1):
             val = row.get(col, '')
-            if pd.isna(val):
+            if col == '熊市平均回撤' and pd.isna(val):
+                bc = row.get('熊市数', 0)
+                if pd.isna(bc):
+                    bc = 0
+                val = '未经历熊市' if int(bc) == 0 else ''
+            elif pd.isna(val):
                 val = ''
             cell = ws_all.cell(row=i, column=j, value=val)
             cell.font = F_BODY
