@@ -69,6 +69,7 @@ HTML_TEMPLATE = """
                 <th>基金经理</th>
                 <th>综合得分</th>
                 <th>评级</th>
+                <th>入选关键原因 (维度×权重)</th>
             </tr>
         </thead>
         <tbody>
@@ -85,10 +86,11 @@ HTML_TEMPLATE = """
                 <th>经理<br>任职(年)</th>
                 <th>年化<br>收益(%)</th>
                 <th>近3年<br>回撤(%)</th>
-                <th>夏普</th>
+                <th>卡玛<br>比率</th>
                 <th>波动率<br>(%)</th>
                 <th>排名<br>分位</th>
-                <th>熊市数</th>
+                <th>熊市平均<br>回撤(%)</th>
+                <th>行业<br>稳定性</th>
             </tr>
         </thead>
         <tbody>
@@ -101,13 +103,12 @@ HTML_TEMPLATE = """
         <thead>
             <tr>
                 <th>代码</th>
-                <th>稳定性<br>(25%)</th>
-                <th>风格<br>(15%)</th>
-                <th>框架<br>(10%)</th>
-                <th>费率<br>(10%)</th>
-                <th>熊市<br>(15%)</th>
-                <th>规模<br>(10%)</th>
+                <th>稳定性<br>(28%)</th>
+                <th>熊市表现<br>(20%)</th>
                 <th>任职<br>(15%)</th>
+                <th>框架(卡玛)<br>(15%)</th>
+                <th>风格(行业)<br>(12%)</th>
+                <th>规模<br>(10%)</th>
                 <th>综合</th>
             </tr>
         </thead>
@@ -119,13 +120,13 @@ HTML_TEMPLATE = """
     <div class="warning-box">
         <strong>⚠️ 重要提醒</strong><br>
         • 本报告基于历史数据回测,<strong>过去业绩不代表未来表现</strong>。<br>
-        • 主观维度(风格一致性、投资框架)用客观指标代理,存在偏差。<br>
-        • 机构持有比例、综合费率用默认值估算,精确值请查阅基金定期报告。<br>
+        • 业绩排名分位基于<strong>全市场近3年收益</strong>计算;熊市表现基于历轮熊市回撤分位。<br>
+        • 行业稳定性需 akshare 数据源支持,eastmoney 模式下回退到波动率代理。<br>
         • 建议结合人工核查后再做投资决策,主动基金合理仓位不超过权益部分30%。
     </div>
 
     <div class="footer">
-        本报告由自动化脚本生成 · 数据来源: 天天基金网 · 评分卡 v1.0<br>
+        本报告由自动化脚本生成 · 数据来源: 天天基金网 / AKShare · 评分卡 v2.0<br>
         如需调整筛选参数,请修改 src/config.py
     </div>
 </body>
@@ -173,6 +174,7 @@ def generate_html_report(top_n_df, all_df):
         manager = row.get('基金经理', '')
         if pd.isna(manager):
             manager = ''
+        reason = row.get('入选原因', '') or ''
         top_rows.append(f"""
             <tr>
                 <td class="rank">{i}</td>
@@ -181,6 +183,7 @@ def generate_html_report(top_n_df, all_df):
                 <td>{manager}</td>
                 <td class="score">{row['综合得分']:.1f}</td>
                 <td><span class="grade-{gc}">{row['评级']}</span></td>
+                <td class="small name">{reason}</td>
             </tr>
         """)
 
@@ -194,10 +197,11 @@ def generate_html_report(top_n_df, all_df):
                 <td>{_fmt(row.get('经理任职年限'), '{:.1f}')}</td>
                 <td>{_fmt(row.get('年化收益率'), '{:.2f}')}</td>
                 <td>{_fmt(row.get('近3年最大回撤'), '{:.2f}')}</td>
-                <td>{_fmt(row.get('夏普比率'), '{:.2f}')}</td>
+                <td>{_fmt(row.get('卡玛比率'), '{:.2f}')}</td>
                 <td>{_fmt(row.get('年化波动率'), '{:.1f}')}</td>
                 <td>{_fmt(row.get('业绩排名分位'), '{:.0f}')}</td>
-                <td>{int(row.get('熊市数', 0))}</td>
+                <td>{_fmt(row.get('熊市平均回撤'), '{:.1f}')}</td>
+                <td>{_fmt(row.get('行业稳定性'), '{:.2f}')}</td>
             </tr>
         """)
 
@@ -208,12 +212,11 @@ def generate_html_report(top_n_df, all_df):
             <tr>
                 <td>{row['基金代码']}</td>
                 <td>{_fmt(row.get('得分_稳定性'), '{:.0f}')}</td>
-                <td>{_fmt(row.get('得分_风格'), '{:.0f}')}</td>
-                <td>{_fmt(row.get('得分_框架'), '{:.0f}')}</td>
-                <td>{_fmt(row.get('得分_费率'), '{:.0f}')}</td>
                 <td>{_fmt(row.get('得分_熊市'), '{:.0f}')}</td>
-                <td>{_fmt(row.get('得分_规模'), '{:.0f}')}</td>
                 <td>{_fmt(row.get('得分_任职'), '{:.0f}')}</td>
+                <td>{_fmt(row.get('得分_框架'), '{:.0f}')}</td>
+                <td>{_fmt(row.get('得分_风格'), '{:.0f}')}</td>
+                <td>{_fmt(row.get('得分_规模'), '{:.0f}')}</td>
                 <td class="score">{row['综合得分']:.1f}</td>
             </tr>
         """)
@@ -274,20 +277,23 @@ def generate_excel_report(top_n_df, all_df, output_path):
     top_cols = [
         '排名', '基金代码', '基金简称', '基金类型', '基金经理',
         '基金规模', '经理任职年限', '年化收益率', '近3年最大回撤',
-        '夏普比率', '年化波动率', '业绩排名分位', '熊市数',
-        '得分_稳定性', '得分_风格', '得分_框架', '得分_费率',
-        '得分_熊市', '得分_规模', '得分_任职', '综合得分', '评级',
+        '卡玛比率', '夏普比率', '年化波动率', '业绩排名分位',
+        '熊市数', '熊市平均回撤', '行业稳定性',
+        '得分_稳定性', '得分_熊市', '得分_任职',
+        '得分_框架', '得分_风格', '得分_规模',
+        '综合得分', '评级', '入选原因',
     ]
 
-    ws_top.merge_cells('A1:V1')
+    last_col_letter = get_column_letter(len(top_cols))
+    ws_top.merge_cells(f'A1:{last_col_letter}1')
     ws_top['A1'] = f"主动基金月度筛选报告 · Top {len(top_n_df)} 推荐"
     ws_top['A1'].font = F_TITLE
     ws_top['A1'].fill = FILL_TITLE
     ws_top['A1'].alignment = ALIGN_C
     ws_top.row_dimensions[1].height = 28
 
-    ws_top.merge_cells('A2:V2')
-    ws_top['A2'] = f"报告日期: {datetime.now().strftime('%Y-%m-%d')}    评分卡 v1.0"
+    ws_top.merge_cells(f'A2:{last_col_letter}2')
+    ws_top['A2'] = f"报告日期: {datetime.now().strftime('%Y-%m-%d')}    评分卡 v2.0"
     ws_top['A2'].font = Font(name='微软雅黑', size=10, italic=True, color='595959')
     ws_top['A2'].alignment = ALIGN_L
 
@@ -311,11 +317,11 @@ def generate_excel_report(top_n_df, all_df, output_path):
             cell.alignment = ALIGN_C
             cell.border = BORDER
             # 数值格式
-            if col in ('基金规模', '经理任职年限', '年化波动率'):
+            if col in ('基金规模', '经理任职年限', '年化波动率', '熊市平均回撤'):
                 cell.number_format = '0.00'
             elif col in ('年化收益率', '近3年最大回撤'):
                 cell.number_format = '0.00'
-            elif col == '夏普比率':
+            elif col in ('夏普比率', '卡玛比率', '行业稳定性'):
                 cell.number_format = '0.00'
             elif col == '综合得分':
                 cell.number_format = '0.0'
@@ -388,22 +394,21 @@ def generate_excel_report(top_n_df, all_df, output_path):
     ws_rule.row_dimensions[1].height = 28
 
     rules = [
-        ('硬性筛选(6项)', '', '', ''),
-        ('1. 经理任职年限', '≥ 5 年', '新经理难验证体系', '排名表+经理表'),
+        ('硬性筛选(6项,NaN 一律放行)', '', '', ''),
+        ('1. 经理任职年限', '≥ 3 年', '放宽至3年纳入近年新锐', '经理表'),
         ('2. 基金成立时间', '≥ 3 年', '新基金数据不可靠', '排名表'),
         ('3. 基金规模', '2 - 100 亿', '过大调仓难,过小有清盘风险', '排名表'),
         ('4. 经理在管基金数', '≤ 5 只', '管太多说明在挂名', '经理表'),
-        ('5. 近3年最大回撤', '≤ 同类中位数 × 1.2', '风控能力检验', '净值计算'),
-        ('6. 机构持有比例', '5% - 70%', '太低=无人买,太高=赎回风险', '半年报(本版用估算)'),
+        ('5. 近3年最大回撤', '≤ 45%(绝对)', '风控能力检验,改绝对避免候选池偏差', '净值计算'),
+        ('6. 近1年收益兜底', '≥ -25%', '过滤长期好但近期暴雷的基金', '排名表'),
         ('', '', '', ''),
-        ('软性评分(7维度,加权满分100)', '权重', '评分逻辑', '代理指标'),
-        ('1. 业绩稳定性', '25%', '近5年同类排名分位平均', '净值年度收益分位'),
-        ('2. 风格一致性', '15%', '波动率<22%最佳', '年化波动率'),
-        ('3. 投资框架', '10%', '夏普比率>0.7较好', '夏普比率'),
-        ('4. 综合费率', '10%', '≤1.5% 较优', '默认1.75%(请人工核对)'),
-        ('5. 经历熊市数', '15%', '经历2018/2022/2024三轮', '净值覆盖判断'),
-        ('6. 规模适中度', '10%', '5-30亿满分', '规模分档'),
-        ('7. 经理任职年限', '15%', '≥10年满分', '年限分档'),
+        ('软性评分(6维度,加权满分100,NaN→50)', '权重', '评分逻辑', '指标'),
+        ('1. 业绩稳定性', '28%', '近3年收益的全市场分位,越高越好', '全市场分位'),
+        ('2. 熊市相对表现', '20%', '历轮熊市平均回撤在候选池内分位 + 经验加成', '净值×熊市区间'),
+        ('3. 经理任职年限', '15%', '≥10年满分,3-5年55分', '年限分档'),
+        ('4. 投资框架', '15%', '卡玛比率(年化收益/最大回撤),≥0.8 满分', '净值计算'),
+        ('5. 风格一致性', '12%', '行业配置余弦相似度,≥0.92 满分 / 退化为波动率', '行业配置历史'),
+        ('6. 规模适中度', '10%', '5-30亿满分,>100降至30', '规模分档'),
         ('', '', '', ''),
         ('评级标准', '', '', ''),
         ('A 级', '≥ 85', '强烈推荐,核心持仓', '权益部分10-20%'),
@@ -426,7 +431,7 @@ def generate_excel_report(top_n_df, all_df, output_path):
             c.alignment = Alignment(horizontal='left' if j == 1 else 'center', vertical='center', wrap_text=True)
             c.border = BORDER
             # 子标题加粗
-            if row_data[0] in ('硬性筛选(6项)', '软性评分(7维度,加权满分100)', '评级标准'):
+            if row_data[0] in ('硬性筛选(6项,NaN 一律放行)', '软性评分(6维度,加权满分100,NaN→50)', '评级标准'):
                 c.font = Font(name='微软雅黑', size=11, bold=True, color='1F4E78')
                 c.fill = PatternFill('solid', start_color='D9E1F2')
 

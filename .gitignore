@@ -4,3 +4,4 @@ cache/
 output/
 *.log
 .env
+.local_backup/

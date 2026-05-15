@@ -152,8 +152,46 @@ def fetch_fund_portfolio(code, year=None):
 
 
 @retry()
-def fetch_fund_industry_allocation(code):
-    """基金行业配置"""
+def fetch_fund_industry_allocation(code, year=None):
+    """基金行业配置(指定年份)"""
+    if year is None:
+        year = datetime.now().year
     time.sleep(PERF_CONFIG['request_delay'])
-    df = ak.fund_portfolio_industry_allocation_em(symbol=code, date=str(datetime.now().year))
+    df = ak.fund_portfolio_industry_allocation_em(symbol=code, date=str(year))
     return df
+
+
+def fetch_recent_industry_allocations(code, years=2):
+    """
+    获取近 N 年的行业配置, 返回 list of dict [{industry: weight, ...}, ...] (老→新)
+    """
+    current_year = datetime.now().year
+    out = []
+    for y in range(current_year - years, current_year + 1):
+        try:
+            df = fetch_fund_industry_allocation(code, year=y)
+            if df is None or len(df) == 0:
+                continue
+            name_col = next((c for c in df.columns if '行业' in c and ('类别' in c or '名称' in c)), None)
+            weight_col = next((c for c in df.columns if '占净值' in c or '占股票' in c), None)
+            if name_col is None or weight_col is None:
+                continue
+            if '截止日期' in df.columns or '公告日期' in df.columns:
+                date_col = '截止日期' if '截止日期' in df.columns else '公告日期'
+                df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+                latest = df[date_col].max()
+                df = df[df[date_col] == latest]
+            alloc = {}
+            for _, row in df.iterrows():
+                ind = str(row[name_col]).strip()
+                try:
+                    w = float(row[weight_col])
+                except (ValueError, TypeError):
+                    continue
+                if ind and ind != 'nan':
+                    alloc[ind] = alloc.get(ind, 0.0) + w
+            if alloc:
+                out.append(alloc)
+        except Exception as e:
+            logger.debug(f'  基金 {code} 行业配置 {y} 获取失败: {e}')
+    return out

@@ -158,3 +158,94 @@ def calc_performance_rank_percentile(fund_returns_list, all_funds_returns_list):
             percentiles.append(percentile)
 
     return np.mean(percentiles) if percentiles else 100
+
+
+def calc_market_percentile(value, full_market_values):
+    """
+    计算单个指标值在全市场中的分位
+    返回 0=最好/最高, 100=最差/最低; 数据不足返回 NaN
+    """
+    if pd.isna(value):
+        return np.nan
+    vals = [v for v in full_market_values if pd.notna(v)]
+    if len(vals) < 2:
+        return np.nan
+    better_than = sum(1 for v in vals if value > v)
+    return (1 - better_than / len(vals)) * 100
+
+
+def calc_calmar(annual_return_pct, max_drawdown_pct):
+    """
+    卡玛比率 = 年化收益率 / 最大回撤
+    同时考虑收益与回撤,比夏普更直观
+    """
+    if pd.isna(annual_return_pct) or pd.isna(max_drawdown_pct):
+        return np.nan
+    if max_drawdown_pct <= 0:
+        return np.nan
+    return annual_return_pct / max_drawdown_pct
+
+
+def calc_bear_period_drawdown(nav_df, bear_periods=None):
+    """
+    计算每轮熊市期间该基金的最大回撤, 返回 dict {(bear_start, bear_end): drawdown_pct}
+    基金净值未覆盖某轮熊市则该项缺失
+    """
+    if bear_periods is None:
+        bear_periods = BEAR_MARKETS
+    if nav_df is None or len(nav_df) == 0:
+        return {}
+
+    nav_df = nav_df.copy()
+    date_col = '净值日期' if '净值日期' in nav_df.columns else nav_df.columns[0]
+    nav_col = '单位净值' if '单位净值' in nav_df.columns else nav_df.columns[1]
+
+    nav_df[date_col] = pd.to_datetime(nav_df[date_col], errors='coerce')
+    nav_df[nav_col] = pd.to_numeric(nav_df[nav_col], errors='coerce')
+    nav_df = nav_df.dropna(subset=[date_col, nav_col]).sort_values(date_col)
+
+    result = {}
+    for bs, be in bear_periods:
+        bs_ts, be_ts = pd.to_datetime(bs), pd.to_datetime(be)
+        period = nav_df[(nav_df[date_col] >= bs_ts) & (nav_df[date_col] <= be_ts)]
+        if len(period) >= 2:
+            result[(bs, be)] = calc_max_drawdown(period[nav_col].values)
+    return result
+
+
+def calc_avg_bear_drawdown(bear_dd_dict):
+    """对所有经历过的熊市回撤取平均(基金未覆盖的熊市不计入)"""
+    if not bear_dd_dict:
+        return np.nan
+    return float(np.mean(list(bear_dd_dict.values())))
+
+
+def calc_industry_similarity(allocations):
+    """
+    计算多期行业配置的稳定性(余弦相似度均值)
+    allocations: list of dict, 每个 dict 为 {industry_name: weight_pct}
+    至少需要 2 期数据,否则返回 NaN; 返回 0-1 越大越稳定
+    """
+    if not allocations or len(allocations) < 2:
+        return np.nan
+
+    all_industries = set()
+    for alloc in allocations:
+        all_industries.update(alloc.keys())
+    industries = sorted(all_industries)
+    if len(industries) == 0:
+        return np.nan
+
+    vectors = []
+    for alloc in allocations:
+        v = np.array([alloc.get(ind, 0.0) for ind in industries], dtype=float)
+        norm = np.linalg.norm(v)
+        if norm > 0:
+            v = v / norm
+        vectors.append(v)
+
+    sims = []
+    for i in range(len(vectors)):
+        for j in range(i + 1, len(vectors)):
+            sims.append(float(np.dot(vectors[i], vectors[j])))
+    return float(np.mean(sims)) if sims else np.nan

@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 from .config import (
-    DATA_SOURCE, FUND_TYPES, HARD_FILTER, SCORE_WEIGHTS, TOP_N, PERF_CONFIG
+    DATA_SOURCE, FUND_TYPES, HARD_FILTER, SCORE_WEIGHTS, TOP_N, PERF_CONFIG, POOL_RANK_WEIGHTS
 )
 from . import metrics
 
@@ -31,10 +31,25 @@ else:
 logger = logging.getLogger(__name__)
 
 
+def _find_col(df, *keywords):
+    """从 DataFrame 找包含所有 keywords 的列名"""
+    for col in df.columns:
+        if all(k in col for k in keywords):
+            return col
+    return None
+
+
+# 模块级缓存,供软评分阶段引用全市场参考数据
+_FULL_MARKET_REF = {
+    'rank_3y': None,    # 全市场近3年收益率(去 NaN), 用于 stability 全市场分位
+}
+
+
 def get_candidate_pool():
     """
     第一步: 获取候选池
-    合并股票型+混合型+QDII,做初步过滤
+    使用综合排名 (近3年 50% + 近1年 30% + 今年来 20%) 取代单一近3年排序
+    同时缓存全市场参考数据供后续分位计算
     """
     logger.info('=' * 60)
     logger.info('Step 1: 获取候选池')
@@ -66,31 +81,57 @@ def get_candidate_pool():
 
     # 标准化列名
     if '基金代码' not in df.columns:
-        for col in df.columns:
-            if '代码' in col:
-                df = df.rename(columns={col: '基金代码'})
-                break
+        c = _find_col(df, '代码')
+        if c:
+            df = df.rename(columns={c: '基金代码'})
     if '基金简称' not in df.columns:
-        for col in df.columns:
-            if '简称' in col or '名称' in col:
-                df = df.rename(columns={col: '基金简称'})
+        for kw in ('简称', '名称'):
+            c = _find_col(df, kw)
+            if c:
+                df = df.rename(columns={c: '基金简称'})
                 break
 
-    # 确保基金代码是 6 位字符串
     df['基金代码'] = df['基金代码'].astype(str).str.zfill(6)
 
-    # 初步过滤: 用近1年和近3年收益率排序,取前 N 名进入详细分析池
-    # 因为对全市场每只都查询会非常慢
-    return_cols = [c for c in df.columns if '近3年' in c]
-    if return_cols:
-        sort_col = return_cols[0]
-        # 转为数值
-        df[sort_col] = pd.to_numeric(df[sort_col], errors='coerce')
-        df = df.sort_values(sort_col, ascending=False, na_position='last')
+    # 找各期收益列(eastmoney 列名: 近1年/近3年/今年来; akshare 类似)
+    col_3y = _find_col(df, '近3年')
+    col_1y = _find_col(df, '近1年')
+    col_ytd = _find_col(df, '今年来') or _find_col(df, '今年')
+
+    for c in (col_3y, col_1y, col_ytd):
+        if c:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+
+    # 缓存全市场近3年收益, 用于软评分 stability 全市场分位
+    if col_3y:
+        _FULL_MARKET_REF['rank_3y'] = df[col_3y].dropna().tolist()
+        logger.info(f'已缓存全市场近3年收益 {len(_FULL_MARKET_REF["rank_3y"])} 条作为分位参考')
+
+    # 综合排名: 各期收益分位加权
+    composite_score = pd.Series(0.0, index=df.index)
+    weight_used = 0.0
+    label_map = {'近3年': col_3y, '近1年': col_1y, '今年来': col_ytd}
+    for label, col in label_map.items():
+        w = POOL_RANK_WEIGHTS.get(label, 0)
+        if col is None or w == 0:
+            continue
+        rank_pct = df[col].rank(ascending=True, pct=True, na_option='bottom')
+        composite_score = composite_score + rank_pct * w
+        weight_used += w
+
+    if weight_used == 0:
+        logger.warning('无可用收益列, 回退到原始顺序')
+    else:
+        df['_composite'] = composite_score / weight_used
+        df = df.sort_values('_composite', ascending=False, na_position='last')
 
     pool_size = PERF_CONFIG['candidate_pool_size']
     candidate = df.head(pool_size).copy()
-    logger.info(f'初步过滤后候选池: {len(candidate)} 只(按近3年收益率排序取前{pool_size})')
+    logger.info(f'综合排名筛出候选池: {len(candidate)} 只 (权重: {POOL_RANK_WEIGHTS})')
+
+    # 固化近1年收益到标准列名供硬筛使用
+    if col_1y and '近1年收益率' not in candidate.columns:
+        candidate['近1年收益率'] = candidate[col_1y]
     return candidate
 
 
@@ -251,29 +292,22 @@ def _parse_tenure(val):
 
 
 def enrich_with_nav_metrics(candidate_df):
-    """第三步: 对候选池每只基金计算净值类指标"""
+    """第三步: 对候选池每只基金计算净值类指标(回撤/收益/夏普/卡玛/熊市表现)"""
     logger.info('=' * 60)
-    logger.info('Step 3: 计算净值类指标(回撤、收益、夏普、熊市数)')
+    logger.info('Step 3: 计算净值类指标(回撤、收益、卡玛、熊市表现)')
     logger.info('=' * 60)
 
     results = []
-    annual_returns_pool = {}  # {year: [所有基金收益列表]}
+    annual_returns_pool = {}  # 候选池年度收益, 作为辅助参考
 
     total = len(candidate_df)
-    for i, row in candidate_df.iterrows():
+    rows = list(candidate_df.iterrows())
+    for i, (_, row) in enumerate(rows):
         code = row['基金代码']
         try:
             nav_df = df_module.fetch_fund_nav(code)
             if nav_df is None or len(nav_df) == 0:
-                results.append({
-                    '基金代码': code,
-                    '近3年最大回撤': np.nan,
-                    '年化收益率': np.nan,
-                    '年化波动率': np.nan,
-                    '夏普比率': np.nan,
-                    '熊市数': 0,
-                    '年度收益': [],
-                })
+                results.append(_empty_nav_metrics(code))
                 continue
 
             max_dd = metrics.calc_recent_drawdown(nav_df, years=3)
@@ -286,23 +320,31 @@ def enrich_with_nav_metrics(candidate_df):
             dates = dates[valid].values
             nav_values = nav_values[valid].values
 
-            annual_ret = metrics.calc_annual_return(nav_values, dates) if len(nav_values) > 1 else 0
-            vol = metrics.calc_volatility(nav_values) if len(nav_values) > 1 else 0
-            sharpe = metrics.calc_sharpe(nav_values, dates) if len(nav_values) > 1 else 0
+            if len(nav_values) > 1:
+                annual_ret = metrics.calc_annual_return(nav_values, dates)
+                vol = metrics.calc_volatility(nav_values)
+                sharpe = metrics.calc_sharpe(nav_values, dates)
+            else:
+                annual_ret = vol = sharpe = np.nan
+
+            calmar = metrics.calc_calmar(annual_ret, max_dd)
             bear_count = metrics.calc_bear_market_count(nav_df)
+            bear_dd_map = metrics.calc_bear_period_drawdown(nav_df)
+            bear_avg_dd = metrics.calc_avg_bear_drawdown(bear_dd_map)
             annual_rets = metrics.calc_annual_returns_by_year(nav_df, years=5)
 
-            # 汇总到 pool 用于后续分位计算
             for y, r in annual_rets:
                 annual_returns_pool.setdefault(y, []).append(r)
 
             results.append({
                 '基金代码': code,
-                '近3年最大回撤': max_dd,
+                '近3年最大回撤': max_dd if max_dd and max_dd > 0 else np.nan,
                 '年化收益率': annual_ret,
                 '年化波动率': vol,
                 '夏普比率': sharpe,
+                '卡玛比率': calmar,
                 '熊市数': bear_count,
+                '熊市平均回撤': bear_avg_dd,
                 '年度收益': annual_rets,
             })
 
@@ -311,24 +353,78 @@ def enrich_with_nav_metrics(candidate_df):
 
         except Exception as e:
             logger.warning(f'  基金 {code} 计算失败: {e}')
-            results.append({
-                '基金代码': code,
-                '近3年最大回撤': np.nan,
-                '年化收益率': np.nan,
-                '年化波动率': np.nan,
-                '夏普比率': np.nan,
-                '熊市数': 0,
-                '年度收益': [],
-            })
+            results.append(_empty_nav_metrics(code))
 
     metrics_df = pd.DataFrame(results)
     candidate_df = candidate_df.merge(metrics_df, on='基金代码', how='left')
 
-    # 计算业绩排名分位
-    logger.info('计算业绩排名分位...')
-    candidate_df['业绩排名分位'] = candidate_df['年度收益'].apply(
-        lambda x: metrics.calc_performance_rank_percentile(x, annual_returns_pool) if x else 100
-    )
+    # 业绩排名分位: 优先全市场近3年分位, 退化为候选池年度分位
+    logger.info('计算业绩排名分位 (全市场参考)...')
+    full_3y_returns = _FULL_MARKET_REF.get('rank_3y') or []
+    rank_3y_col = _find_col(candidate_df, '近3年')
+
+    def _stability_percentile(row):
+        if rank_3y_col and full_3y_returns:
+            val = pd.to_numeric(row.get(rank_3y_col), errors='coerce')
+            p = metrics.calc_market_percentile(val, full_3y_returns)
+            if pd.notna(p):
+                return p
+        ar = row.get('年度收益', [])
+        if ar:
+            return metrics.calc_performance_rank_percentile(ar, annual_returns_pool)
+        return np.nan
+
+    candidate_df['业绩排名分位'] = candidate_df.apply(_stability_percentile, axis=1)
+    return candidate_df
+
+
+def _empty_nav_metrics(code):
+    return {
+        '基金代码': code,
+        '近3年最大回撤': np.nan,
+        '年化收益率': np.nan,
+        '年化波动率': np.nan,
+        '夏普比率': np.nan,
+        '卡玛比率': np.nan,
+        '熊市数': 0,
+        '熊市平均回撤': np.nan,
+        '年度收益': [],
+    }
+
+
+def enrich_with_industry(candidate_df):
+    """
+    第三B步: 拉取近 2 年行业配置, 计算风格(行业)一致性
+    仅 akshare 数据源支持; eastmoney 模式直接返回 NaN(后续软评分按中位数处理)
+    """
+    logger.info('=' * 60)
+    logger.info('Step 3B: 计算行业配置稳定性(风格一致性)')
+    logger.info('=' * 60)
+
+    if not hasattr(df_module, 'fetch_recent_industry_allocations'):
+        logger.info(f'{logger_prefix} 数据源不支持行业配置, 跳过(风格维度将由波动率代理或中位数填充)')
+        candidate_df['行业稳定性'] = np.nan
+        return candidate_df
+
+    sims = []
+    total = len(candidate_df)
+    for i, (_, row) in enumerate(candidate_df.iterrows()):
+        code = row['基金代码']
+        try:
+            allocs = df_module.fetch_recent_industry_allocations(code, years=2)
+            sim = metrics.calc_industry_similarity(allocs) if allocs else np.nan
+        except Exception as e:
+            logger.debug(f'  基金 {code} 行业稳定性计算失败: {e}')
+            sim = np.nan
+        sims.append({'基金代码': code, '行业稳定性': sim})
+
+        if (i + 1) % 30 == 0:
+            logger.info(f'  进度: {i+1}/{total}')
+
+    sim_df = pd.DataFrame(sims)
+    candidate_df = candidate_df.merge(sim_df, on='基金代码', how='left')
+    valid_n = candidate_df['行业稳定性'].notna().sum()
+    logger.info(f'行业稳定性数据完整度: {valid_n}/{total}')
     return candidate_df
 
 
@@ -390,17 +486,14 @@ def enrich_with_basics(candidate_df):
                 candidate_df['基金年龄'] = np.nan
             candidate_df['成立日期'] = pd.NaT
 
-    # 3. 费率: 默认行业均值
-    candidate_df['综合费率'] = 1.75
-
-    # 4. 机构持有比例: 默认值
-    candidate_df['机构持有比例'] = 30
-
     return candidate_df
 
 
 def apply_hard_filter(df):
-    """第五步: 应用 6 项硬性筛选"""
+    """
+    第五步: 硬性筛选
+    设计: NaN 一律放行(由软评分通过中位数降权); 用绝对阈值代替"同类中位数"
+    """
     logger.info('=' * 60)
     logger.info('Step 5: 应用硬性筛选')
     logger.info('=' * 60)
@@ -412,37 +505,49 @@ def apply_hard_filter(df):
 
     hf = HARD_FILTER
 
+    def _fail(mask, reason):
+        df.loc[mask, '硬筛通过'] = False
+        df.loc[mask, '淘汰原因'] = df.loc[mask, '淘汰原因'] + reason + ';'
+
     # 1. 经理任职年限
-    mask = df['经理任职年限'].notna() & (df['经理任职年限'] < hf['min_manager_years'])
-    df.loc[mask, '硬筛通过'] = False
-    df.loc[mask, '淘汰原因'] = df.loc[mask, '淘汰原因'] + f'经理任职<{hf["min_manager_years"]}年;'
+    _fail(
+        df['经理任职年限'].notna() & (df['经理任职年限'] < hf['min_manager_years']),
+        f'经理任职<{hf["min_manager_years"]}年',
+    )
 
     # 2. 基金年龄
-    mask = df['基金年龄'].notna() & (df['基金年龄'] < hf['min_fund_age'])
-    df.loc[mask, '硬筛通过'] = False
-    df.loc[mask, '淘汰原因'] = df.loc[mask, '淘汰原因'] + f'基金成立<{hf["min_fund_age"]}年;'
+    _fail(
+        df['基金年龄'].notna() & (df['基金年龄'] < hf['min_fund_age']),
+        f'基金成立<{hf["min_fund_age"]}年',
+    )
 
     # 3. 规模
-    mask = df['基金规模'].notna() & ((df['基金规模'] < hf['min_scale']) | (df['基金规模'] > hf['max_scale']))
-    df.loc[mask, '硬筛通过'] = False
-    df.loc[mask, '淘汰原因'] = df.loc[mask, '淘汰原因'] + f'规模不在{hf["min_scale"]}-{hf["max_scale"]}亿;'
+    _fail(
+        df['基金规模'].notna() & ((df['基金规模'] < hf['min_scale']) | (df['基金规模'] > hf['max_scale'])),
+        f'规模不在{hf["min_scale"]}-{hf["max_scale"]}亿',
+    )
 
     # 4. 经理在管基金数
     if '经理在管基金数' in df.columns:
         count_num = pd.to_numeric(df['经理在管基金数'], errors='coerce')
-        mask = count_num.notna() & (count_num > hf['max_funds_per_manager'])
-        df.loc[mask, '硬筛通过'] = False
-        df.loc[mask, '淘汰原因'] = df.loc[mask, '淘汰原因'] + f'在管>{hf["max_funds_per_manager"]}只;'
+        _fail(
+            count_num.notna() & (count_num > hf['max_funds_per_manager']),
+            f'在管>{hf["max_funds_per_manager"]}只',
+        )
 
-    # 5. 回撤(对比同类中位数)
-    median_dd = df['近3年最大回撤'].median()
-    if pd.notna(median_dd):
-        mask = df['近3年最大回撤'].notna() & (df['近3年最大回撤'] > median_dd * hf['max_drawdown_ratio'])
-        df.loc[mask, '硬筛通过'] = False
-        df.loc[mask, '淘汰原因'] = df.loc[mask, '淘汰原因'] + f'回撤>同类中位数*{hf["max_drawdown_ratio"]};'
+    # 5. 回撤(绝对阈值)
+    _fail(
+        df['近3年最大回撤'].notna() & (df['近3年最大回撤'] > hf['max_drawdown_pct']),
+        f'近3年回撤>{hf["max_drawdown_pct"]}%',
+    )
 
-    # 6. 机构持有比例(默认值时跳过该项,以免误杀)
-    # 此处由于真实数据获取成本高,默认填的 30,所以这条筛选实际放行所有
+    # 6. 近1年收益兜底(防长期好但近期暴雷)
+    if '近1年收益率' in df.columns:
+        r1y = pd.to_numeric(df['近1年收益率'], errors='coerce')
+        _fail(
+            r1y.notna() & (r1y < hf['min_recent_1y_return']),
+            f'近1年收益<{hf["min_recent_1y_return"]}%',
+        )
 
     passed = df['硬筛通过'].sum()
     logger.info(f'硬筛结果: {n0} 只 → {passed} 只通过')
@@ -450,30 +555,91 @@ def apply_hard_filter(df):
 
 
 def calc_soft_score(df):
-    """第六步: 软性评分"""
+    """
+    第六步: 软性评分(NaN 一律返回 50, 不再分散两套策略)
+    """
     logger.info('=' * 60)
     logger.info('Step 6: 计算软性评分')
     logger.info('=' * 60)
 
     df = df.copy()
+    MEDIAN = 50
 
     def score_stability(percentile):
         if pd.isna(percentile):
-            return 0
-        if percentile <= 25:
+            return MEDIAN
+        if percentile <= 10:
             return 100
+        elif percentile <= 25:
+            return 88
         elif percentile <= 50:
             return 70
         elif percentile <= 70:
+            return 50
+        else:
+            return 25
+
+    def score_framework(calmar):
+        # 卡玛比率 = 年化收益 / 最大回撤
+        if pd.isna(calmar):
+            return MEDIAN
+        if calmar >= 0.8:
+            return 100
+        elif calmar >= 0.5:
+            return 85
+        elif calmar >= 0.3:
+            return 70
+        elif calmar >= 0.1:
+            return 55
+        elif calmar >= 0:
             return 40
         else:
-            return 15
+            return 20
 
-    def score_style(vol):
-        # 用波动率作为风格稳定性代理(波动小说明持仓稳定)
-        # 优秀: <20, 一般: 20-25, 较差: >25
+    def score_scale(scale):
+        if pd.isna(scale):
+            return MEDIAN
+        if 5 <= scale <= 30:
+            return 100
+        elif 2 <= scale <= 50:
+            return 82
+        elif scale <= 100:
+            return 60
+        else:
+            return 30
+
+    def score_tenure(years):
+        if pd.isna(years):
+            return MEDIAN
+        if years >= 10:
+            return 100
+        elif years >= 7:
+            return 85
+        elif years >= 5:
+            return 70
+        elif years >= 3:
+            return 55
+        else:
+            return 40
+
+    # 风格一致性: 行业相似度优先, NaN 时回退波动率代理(eastmoney 场景)
+    def score_style_industry(sim):
+        if pd.isna(sim):
+            return None
+        if sim >= 0.92:
+            return 100
+        elif sim >= 0.85:
+            return 85
+        elif sim >= 0.75:
+            return 70
+        elif sim >= 0.6:
+            return 55
+        else:
+            return 35
+
+    def score_style_volatility(vol):
         if pd.isna(vol):
-            return 50
+            return MEDIAN
         if vol < 18:
             return 90
         elif vol < 22:
@@ -483,65 +649,41 @@ def calc_soft_score(df):
         else:
             return 40
 
-    def score_framework(sharpe):
-        # 用夏普比率作为投资框架质量代理
-        if pd.isna(sharpe):
-            return 50
-        if sharpe >= 1.0:
-            return 95
-        elif sharpe >= 0.7:
-            return 80
-        elif sharpe >= 0.4:
-            return 65
-        elif sharpe >= 0:
-            return 50
-        else:
-            return 30
+    def score_style(row):
+        s = score_style_industry(row.get('行业稳定性'))
+        if s is not None:
+            return s
+        return score_style_volatility(row.get('年化波动率'))
 
-    def score_fee(fee):
-        if pd.isna(fee):
-            return 60
-        if fee <= 1.0:
-            return 100
-        elif fee <= 1.5:
-            return 80
-        elif fee <= 2.0:
-            return 60
-        else:
-            return 30
+    # 熊市相对表现: 候选池内对"熊市平均回撤"做分位
+    bear_dd_series = pd.to_numeric(df['熊市平均回撤'], errors='coerce')
+    valid_bear = bear_dd_series.dropna()
+    if len(valid_bear) >= 5:
+        df['熊市回撤分位'] = bear_dd_series.rank(ascending=True, pct=True) * 100
+    else:
+        df['熊市回撤分位'] = np.nan
 
-    def score_bear(count):
-        return min(max(count, 0), 3) / 3 * 100
-
-    def score_scale(scale):
-        if pd.isna(scale):
-            return 50
-        if 5 <= scale <= 30:
-            return 100
-        elif 2 <= scale <= 50:
-            return 80
-        elif scale <= 100:
-            return 60
+    def score_bear_perf(percentile, bear_count):
+        if pd.isna(percentile):
+            return MEDIAN
+        if percentile <= 20:
+            base = 100
+        elif percentile <= 40:
+            base = 82
+        elif percentile <= 60:
+            base = 65
+        elif percentile <= 80:
+            base = 45
         else:
-            return 0
-
-    def score_tenure(years):
-        if pd.isna(years):
-            return 50
-        if years >= 10:
-            return 100
-        elif years >= 7:
-            return 85
-        elif years >= 5:
-            return 70
-        else:
-            return 50
+            base = 25
+        # 经历过更多熊市样本更可靠, 微调系数
+        bonus = (min(bear_count or 0, 3) - 1) * 2.5
+        return float(min(100, max(0, base + bonus)))
 
     df['得分_稳定性'] = df['业绩排名分位'].apply(score_stability)
-    df['得分_风格'] = df['年化波动率'].apply(score_style)
-    df['得分_框架'] = df['夏普比率'].apply(score_framework)
-    df['得分_费率'] = df['综合费率'].apply(score_fee)
-    df['得分_熊市'] = df['熊市数'].apply(score_bear)
+    df['得分_框架'] = df['卡玛比率'].apply(score_framework)
+    df['得分_风格'] = df.apply(score_style, axis=1)
+    df['得分_熊市'] = df.apply(lambda r: score_bear_perf(r.get('熊市回撤分位'), r.get('熊市数', 0)), axis=1)
     df['得分_规模'] = df['基金规模'].apply(score_scale)
     df['得分_任职'] = df['经理任职年限'].apply(score_tenure)
 
@@ -550,13 +692,11 @@ def calc_soft_score(df):
         df['得分_稳定性'] * w['stability']
         + df['得分_风格'] * w['style']
         + df['得分_框架'] * w['framework']
-        + df['得分_费率'] * w['fee']
-        + df['得分_熊市'] * w['bear_market']
+        + df['得分_熊市'] * w['bear_perf']
         + df['得分_规模'] * w['scale']
         + df['得分_任职'] * w['tenure']
     )
 
-    # 评级
     def grade(s, passed):
         if not passed:
             return '未通过硬筛'
@@ -573,6 +713,34 @@ def calc_soft_score(df):
     return df
 
 
+def add_explanation(df):
+    """
+    为每只基金生成"入选关键原因": Top3 贡献项 维度×分×权重
+    """
+    score_dim_to_weight = {
+        '稳定性': SCORE_WEIGHTS['stability'],
+        '熊市': SCORE_WEIGHTS['bear_perf'],
+        '任职': SCORE_WEIGHTS['tenure'],
+        '框架': SCORE_WEIGHTS['framework'],
+        '风格': SCORE_WEIGHTS['style'],
+        '规模': SCORE_WEIGHTS['scale'],
+    }
+
+    def _explain(row):
+        contributions = []
+        for dim, w in score_dim_to_weight.items():
+            score = row.get(f'得分_{dim}')
+            if pd.notna(score):
+                contributions.append((dim, score, w, score * w))
+        contributions.sort(key=lambda x: x[3], reverse=True)
+        top3 = contributions[:3]
+        return ' | '.join(f'{d}{s:.0f}×{w:.2f}' for d, s, w, _ in top3)
+
+    df = df.copy()
+    df['入选原因'] = df.apply(_explain, axis=1)
+    return df
+
+
 def run_screening():
     """完整流程: 返回 Top N 基金 + 全部评分结果"""
     logger.info('\n' + '*' * 70)
@@ -586,8 +754,10 @@ def run_screening():
     candidate = enrich_with_manager_info(candidate)
     candidate = enrich_with_basics(candidate)
     candidate = enrich_with_nav_metrics(candidate)
+    candidate = enrich_with_industry(candidate)
     candidate = apply_hard_filter(candidate)
     candidate = calc_soft_score(candidate)
+    candidate = add_explanation(candidate)
 
     # 排序
     passed = candidate[candidate['硬筛通过']].copy()
@@ -597,6 +767,9 @@ def run_screening():
     logger.info(f'\n最终结果: Top {len(top_n)} 基金')
     if len(top_n) > 0:
         for i, (_, row) in enumerate(top_n.iterrows(), 1):
-            logger.info(f'  {i:2d}. {row["基金代码"]} {row["基金简称"]:30s} 得分={row["综合得分"]:.1f} 评级={row["评级"]}')
+            logger.info(
+                f'  {i:2d}. {row["基金代码"]} {row["基金简称"]:30s} '
+                f'得分={row["综合得分"]:.1f} 评级={row["评级"]} | {row.get("入选原因", "")}'
+            )
 
     return top_n, candidate
