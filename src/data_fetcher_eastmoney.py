@@ -325,74 +325,65 @@ def fetch_fund_details_batch(codes):
 
 # ============================================================================
 # 行业配置(用于"风格一致性"评分维度)
+# 备注: 东财对应的页面是 JS 模板渲染, 没有干净的公开 API;
+# 实测 api.fund.eastmoney.com/f10/HYPZ 总返回 ErrCode=4 (404)
+# 务实做法: 复用 akshare 的 fund_portfolio_industry_allocation_em
+# (akshare 已在 requirements.txt 中)
 # ============================================================================
 
-# 不使用 @retry: 行业数据可缺失,失败时直接 NaN,由软评分波动率代理兜底
-# 重试 3x2s 在 300 只基金上会导致 30+ 分钟超时
 def fetch_recent_industry_allocations(code, years=2):
     """
-    从天天基金 API 获取近 N 年的行业配置历史
-    返回 list of dict [{industry: weight, ...}, ...] (按期排序, 老→新)
-    数据缺失或解析失败返回 [] (不重试, 失败快速跳过)
+    通过 akshare 拉取近 N 年的行业配置, 返回 list of dict, 老→新
+    每个 dict 形如 {industry_name: weight_pct, ...}
+    失败立即返回 [], 不重试 (软评分会回退到波动率代理)
     """
-    time.sleep(PERF_CONFIG['request_delay'])
-
-    url = 'https://api.fund.eastmoney.com/f10/HYPZ/'
-    params = {
-        'fundCode': code,
-        'OSVersion': '14.3',
-        'deviceid': 'Wap',
-    }
-    headers = {
-        'User-Agent': HEADERS['User-Agent'],
-        'Referer': f'https://fundf10.eastmoney.com/hytz_{code}.html',
-        'Accept': '*/*',
-    }
-
     try:
-        # 短超时:行业数据非关键,失败立刻跳过
-        resp = requests.get(url, params=params, headers=headers, timeout=8)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        logger.debug(f'  基金 {code} 行业配置 API 失败: {e}')
+        import akshare as ak
+    except ImportError:
+        logger.debug('akshare 不可用, 跳过行业配置')
         return []
 
-    if not isinstance(data, dict):
-        return []
-    if data.get('ErrCode') not in (0, None, '0'):
-        return []
+    out_by_date = {}
+    current_year = datetime.now().year
 
-    detail = (data.get('Data') or {}).get('HYPZDetail') or []
-    if not detail:
-        return []
-
-    # 取最近 years*2 期 (每年大约 2 期: 中报+年报)
-    max_periods = max(2, years * 2)
-    out = []
-    for period in detail[:max_periods]:
-        industries = (period.get('FundIndustry')
-                      or period.get('Industries')
-                      or period.get('HYPZ')
-                      or [])
-        if not industries:
+    for y in range(current_year - years, current_year + 1):
+        time.sleep(PERF_CONFIG['request_delay'])
+        try:
+            df = ak.fund_portfolio_industry_allocation_em(symbol=code, date=str(y))
+        except Exception as e:
+            logger.debug(f'  基金 {code} 行业 {y} 拉取失败: {e}')
             continue
 
-        alloc = {}
-        for item in industries:
-            if not isinstance(item, dict):
-                continue
-            name = (item.get('HYMC') or item.get('Industry') or item.get('HYDM') or '').strip()
-            weight_raw = (item.get('ZJZBL') or item.get('JZBL')
-                          or item.get('Weight') or item.get('NetValueRatio') or '0')
+        if df is None or len(df) == 0:
+            continue
+
+        # 兼容列名: 行业类别/行业名称, 占净值比例/占股票市值比, 截止时间/截止日期/公告日期
+        name_col = next((c for c in df.columns
+                         if '行业' in str(c) and ('类别' in str(c) or '名称' in str(c))), None)
+        weight_col = next((c for c in df.columns
+                           if '占净值' in str(c) or '占股票' in str(c)), None)
+        date_col = next((c for c in df.columns
+                         if '截止' in str(c) or '公告日期' in str(c)), None)
+
+        if not (name_col and weight_col):
+            continue
+
+        for _, row in df.iterrows():
+            d_raw = row.get(date_col) if date_col else str(y)
             try:
-                w = float(str(weight_raw).replace('%', '').strip()) if weight_raw else 0
+                d = str(pd.to_datetime(d_raw).date()) if d_raw else str(y)
+            except Exception:
+                d = str(d_raw)
+
+            name = str(row[name_col]).strip()
+            try:
+                w = float(row[weight_col])
             except (ValueError, TypeError):
                 continue
-            if name and w > 0:
-                alloc[name] = alloc.get(name, 0.0) + w
-        if alloc:
-            out.append(alloc)
+            if name and name not in ('nan', '') and w > 0:
+                out_by_date.setdefault(d, {})
+                out_by_date[d][name] = out_by_date[d].get(name, 0.0) + w
 
-    out.reverse()  # API 返回新→老, 反转为 老→新
-    return out
+    # 按日期排序 老→新
+    sorted_dates = sorted(d for d in out_by_date.keys() if out_by_date[d])
+    return [out_by_date[d] for d in sorted_dates]
