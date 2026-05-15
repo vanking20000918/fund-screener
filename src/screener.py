@@ -428,39 +428,60 @@ def _empty_nav_metrics(code):
     }
 
 
-def enrich_with_industry(candidate_df):
+def enrich_with_industry(candidate_df, only_passed=True):
     """
     第三B步: 拉取近 2 年行业配置, 计算风格(行业)一致性
-    仅 akshare 数据源支持; eastmoney 模式直接返回 NaN(后续软评分按中位数处理)
+    only_passed=True 时仅给硬筛通过的基金抓取(性能优化, 省 60-70% API 调用)
+    数据缺失返回 NaN; 软评分阶段会回退到波动率代理
     """
     logger.info('=' * 60)
-    logger.info('Step 3B: 计算行业配置稳定性(风格一致性)')
+    logger.info('Step 7: 计算行业配置稳定性(风格一致性)')
     logger.info('=' * 60)
 
-    if not hasattr(df_module, 'fetch_recent_industry_allocations'):
-        logger.info(f'{logger_prefix} 数据源不支持行业配置, 跳过(风格维度将由波动率代理或中位数填充)')
+    candidate_df = candidate_df.copy()
+    if '行业稳定性' not in candidate_df.columns:
         candidate_df['行业稳定性'] = np.nan
+
+    if not hasattr(df_module, 'fetch_recent_industry_allocations'):
+        logger.info(f'{logger_prefix} 数据源不支持行业配置, 跳过(风格维度将由波动率代理填充)')
         return candidate_df
 
-    sims = []
-    total = len(candidate_df)
-    for i, (_, row) in enumerate(candidate_df.iterrows()):
+    # 决定哪些基金需要拉取行业数据
+    if only_passed and '硬筛通过' in candidate_df.columns:
+        target_mask = candidate_df['硬筛通过'] == True
+        n_target = int(target_mask.sum())
+        logger.info(f'仅给硬筛通过的 {n_target} 只基金抓行业配置 (节省 ~{len(candidate_df) - n_target} 次 API 调用)')
+    else:
+        target_mask = pd.Series(True, index=candidate_df.index)
+        n_target = len(candidate_df)
+
+    if n_target == 0:
+        logger.info('无目标基金, 跳过行业配置抓取')
+        return candidate_df
+
+    sims = {}
+    fetched = 0
+    failed = 0
+    for idx, row in candidate_df[target_mask].iterrows():
         code = row['基金代码']
         try:
             allocs = df_module.fetch_recent_industry_allocations(code, years=2)
             sim = metrics.calc_industry_similarity(allocs) if allocs else np.nan
+            if not pd.isna(sim):
+                fetched += 1
+            else:
+                failed += 1
         except Exception as e:
             logger.debug(f'  基金 {code} 行业稳定性计算失败: {e}')
             sim = np.nan
-        sims.append({'基金代码': code, '行业稳定性': sim})
+            failed += 1
+        sims[idx] = sim
 
-        if (i + 1) % 30 == 0:
-            logger.info(f'  进度: {i+1}/{total}')
+        if (fetched + failed) % 20 == 0:
+            logger.info(f'  进度: {fetched + failed}/{n_target} (成功={fetched}, 失败={failed})')
 
-    sim_df = pd.DataFrame(sims)
-    candidate_df = candidate_df.merge(sim_df, on='基金代码', how='left')
-    valid_n = candidate_df['行业稳定性'].notna().sum()
-    logger.info(f'行业稳定性数据完整度: {valid_n}/{total}')
+    candidate_df.loc[list(sims.keys()), '行业稳定性'] = pd.Series(sims)
+    logger.info(f'行业稳定性最终完整度: 成功={fetched}, 失败={failed}, 跳过={len(candidate_df) - n_target}')
     return candidate_df
 
 
@@ -819,8 +840,9 @@ def run_screening():
     candidate = enrich_with_manager_info(candidate)
     candidate = enrich_with_basics(candidate)
     candidate = enrich_with_nav_metrics(candidate)
-    candidate = enrich_with_industry(candidate)
     candidate = apply_hard_filter(candidate)
+    # 行业配置抓取放在硬筛之后, 仅处理通过的基金以节省时间
+    candidate = enrich_with_industry(candidate, only_passed=True)
     candidate = calc_soft_score(candidate)
     candidate = add_explanation(candidate)
 

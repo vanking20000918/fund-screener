@@ -327,12 +327,13 @@ def fetch_fund_details_batch(codes):
 # 行业配置(用于"风格一致性"评分维度)
 # ============================================================================
 
-@retry()
+# 不使用 @retry: 行业数据可缺失,失败时直接 NaN,由软评分波动率代理兜底
+# 重试 3x2s 在 300 只基金上会导致 30+ 分钟超时
 def fetch_recent_industry_allocations(code, years=2):
     """
     从天天基金 API 获取近 N 年的行业配置历史
     返回 list of dict [{industry: weight, ...}, ...] (按期排序, 老→新)
-    数据缺失或解析失败返回 []
+    数据缺失或解析失败返回 [] (不重试, 失败快速跳过)
     """
     time.sleep(PERF_CONFIG['request_delay'])
 
@@ -349,7 +350,8 @@ def fetch_recent_industry_allocations(code, years=2):
     }
 
     try:
-        resp = requests.get(url, params=params, headers=headers, timeout=30)
+        # 短超时:行业数据非关键,失败立刻跳过
+        resp = requests.get(url, params=params, headers=headers, timeout=8)
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
