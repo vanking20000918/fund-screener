@@ -700,30 +700,43 @@ def calc_soft_score(df):
             return 20
 
     def score_scale(scale):
+        """规模适中度: 钟形分段线性
+        甜区 [5,30] 亿满分; [2,5] 缓升; [30,50] 轻度下滑;
+        [50,100] 调仓难度上升明显; >100 亿超大型继续衰减; ≥200 封底 30"""
         if pd.isna(scale):
             return MEDIAN
-        if 5 <= scale <= 30:
-            return 100
-        elif 2 <= scale <= 50:
-            return 82
-        elif scale <= 100:
-            return 60
-        else:
-            return 30
+        if scale < 2:
+            # 硬筛会过滤, 兜底 NaN 放行场景
+            return max(20.0, 30 + scale / 2 * 30)
+        if scale < 5:
+            return 60 + (scale - 2) / 3 * 40       # 2→60, 5→100
+        if scale <= 30:
+            return 100                              # 甜区
+        if scale <= 50:
+            return 100 - (scale - 30) / 20 * 15    # 30→100, 50→85
+        if scale <= 100:
+            return 85 - (scale - 50) / 50 * 30     # 50→85, 100→55
+        if scale <= 200:
+            return 55 - (scale - 100) / 100 * 25   # 100→55, 200→30
+        return 30
 
     def score_tenure(years):
+        """经理任职年限: 分段线性, 边际递减
+        关键点 3年=55, 5年=72, 7年=85, 10年=95, 15+年=100"""
         if pd.isna(years):
             return MEDIAN
-        if years >= 10:
-            return 100
-        elif years >= 7:
-            return 85
-        elif years >= 5:
-            return 70
-        elif years >= 3:
-            return 55
-        else:
-            return 40
+        if years < 3:
+            # 硬筛会过滤, 兜底 NaN 放行场景
+            return max(20.0, 40 + years / 3 * 15)
+        if years < 5:
+            return 55 + (years - 3) / 2 * 17       # 3→55, 5→72
+        if years < 7:
+            return 72 + (years - 5) / 2 * 13       # 5→72, 7→85
+        if years < 10:
+            return 85 + (years - 7) / 3 * 10       # 7→85, 10→95
+        if years < 15:
+            return 95 + (years - 10) / 5 * 5       # 10→95, 15→100
+        return 100
 
     # 风格一致性: 行业相似度优先, NaN 时回退波动率代理(eastmoney 场景)
     def score_style_industry(sim):
