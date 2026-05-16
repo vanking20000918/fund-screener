@@ -5,3 +5,6 @@ output/
 *.log
 .env
 .local_backup/
+
+# 临时分析脚本 (开头下划线, 含本地下载路径或一次性调试代码)
+_*.py

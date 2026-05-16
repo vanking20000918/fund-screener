@@ -11,12 +11,8 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
-# 熊市定义: (起始日, 结束日)
-BEAR_MARKETS = [
-    ('2018-01-29', '2019-01-04'),   # 2018 贸易战熊市
-    ('2021-12-13', '2022-10-31'),   # 2022 流动性危机
-    ('2023-08-01', '2024-02-05'),   # 2024 政策预期低迷
-]
+# 熊市定义 (起始日, 结束日) — 从 config 引入, 支持月度维护
+from .config import BEAR_MARKETS as BEAR_MARKETS  # noqa: E402,F401
 
 
 def calc_max_drawdown(nav_series):
@@ -218,6 +214,109 @@ def calc_avg_bear_drawdown(bear_dd_dict):
     if not bear_dd_dict:
         return np.nan
     return float(np.mean(list(bear_dd_dict.values())))
+
+
+def detect_bear_markets(index_series, params=None):
+    """
+    基于一条合成"指数序列"自动检测熊市段。
+    index_series: pd.Series, index 是日期(可转 datetime), value 是合成指数值(如候选池中位 NAV)
+    params: dict, 见 config.BEAR_DETECT_PARAMS
+    返回 list[(start_str, end_str, drawdown_pct)], 已按时间排序。
+
+    算法 (Peak-to-Trough drawdown clustering):
+    1. 对序列遍历, 维护当前 cummax 和"自该 max 以来的最低谷"
+    2. 当下跌幅度 >= min_drawdown_pct 时, 标记进入熊市
+    3. 直到价格重新创新高(超过原 peak) → 熊市结束(end = 最低谷日期)
+    4. 持续天数 < min_duration_days 的段过滤
+    """
+    if params is None:
+        from .config import BEAR_DETECT_PARAMS
+        params = BEAR_DETECT_PARAMS
+
+    s = pd.Series(index_series).copy()
+    s.index = pd.to_datetime(s.index, errors='coerce')
+    s = s[~s.index.isna()].sort_index()
+    s = pd.to_numeric(s, errors='coerce').dropna()
+    if len(s) < 60:
+        return []
+
+    min_dd = float(params.get('min_drawdown_pct', 18.0))
+    min_dur = int(params.get('min_duration_days', 60))
+
+    segments = []
+    peak_val = s.iloc[0]
+    peak_date = s.index[0]
+    trough_val = s.iloc[0]
+    trough_date = s.index[0]
+    in_bear = False
+    bear_start = None
+
+    for date, val in s.items():
+        if val >= peak_val:
+            # 新高 → 若处熊市中, 段结束
+            if in_bear:
+                dd = (peak_val - trough_val) / peak_val * 100
+                duration = (trough_date - bear_start).days
+                if duration >= min_dur and dd >= min_dd:
+                    segments.append((
+                        bear_start.strftime('%Y-%m-%d'),
+                        trough_date.strftime('%Y-%m-%d'),
+                        round(float(dd), 2),
+                    ))
+                in_bear = False
+            peak_val = val
+            peak_date = date
+            trough_val = val
+            trough_date = date
+        else:
+            if val < trough_val:
+                trough_val = val
+                trough_date = date
+            dd_now = (peak_val - val) / peak_val * 100
+            if not in_bear and dd_now >= min_dd:
+                in_bear = True
+                bear_start = peak_date
+
+    # 收尾: 当前仍在熊市且未恢复
+    if in_bear:
+        dd = (peak_val - trough_val) / peak_val * 100
+        duration = (trough_date - bear_start).days
+        if duration >= min_dur and dd >= min_dd:
+            segments.append((
+                bear_start.strftime('%Y-%m-%d'),
+                trough_date.strftime('%Y-%m-%d'),
+                round(float(dd), 2),
+            ))
+
+    return segments
+
+
+def diff_bear_markets(detected, configured, overlap_days=30):
+    """
+    返回 detected 中"未在 configured 列表里"的新段。
+    overlap_days: 与已配置段允许的最大日期重叠 (避免微小窗口差异重复提示)
+    """
+    configured_ranges = []
+    for s, e in (configured or []):
+        try:
+            configured_ranges.append((pd.to_datetime(s), pd.to_datetime(e)))
+        except Exception:
+            continue
+
+    new_segments = []
+    for s, e, dd in detected:
+        ds, de = pd.to_datetime(s), pd.to_datetime(e)
+        overlap = False
+        for cs, ce in configured_ranges:
+            # 任一端在已配置段内, 或 detected 段完全包含 configured 段
+            inter_start = max(ds, cs)
+            inter_end = min(de, ce)
+            if (inter_end - inter_start).days > -overlap_days:
+                overlap = True
+                break
+        if not overlap:
+            new_segments.append((s, e, dd))
+    return new_segments
 
 
 def calc_industry_similarity(allocations):

@@ -40,15 +40,13 @@ def main():
         if len(top_n_df) == 0:
             logger.warning('未筛选出任何基金,仍发送空报告')
 
-        # 1B. 跑滚动 18 个月回测做评分体系验证 (失败降级, 不阻塞月度邮件)
+        # 1B. 跑滚动多窗口回测做评分体系验证 (失败降级, 不阻塞月度邮件)
         backtest_result = None
         try:
-            import pandas as pd
-            from src.backtest import run_backtest
-            as_of = (pd.Timestamp.now() - pd.DateOffset(months=18)).normalize()
-            logger.info(f'开始评分体系回测验证: as_of={as_of.date()}, 持有至今...')
-            backtest_result = run_backtest(
-                as_of_date=as_of, hold_end_date=None,
+            from src.backtest import run_rolling_backtest
+            logger.info('开始评分体系滚动回测验证 (5 个起点)...')
+            backtest_result = run_rolling_backtest(
+                hold_end_date=None,
                 candidate_pool_size=100, top_n=20, max_universe=300,
             )
         except Exception as bt_e:

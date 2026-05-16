@@ -270,46 +270,64 @@ def _apply_hard_filter_pit(df):
 
 
 def _soft_score_pit(df):
+    """评分卡 v2.1 (与 screener.calc_soft_score 阈值一致)"""
     MED = 50
+
     def s_stab(p):
         if pd.isna(p): return MED
-        return 100 if p <= 10 else 88 if p <= 25 else 70 if p <= 50 else 50 if p <= 70 else 25
+        if p <= 5:    return 100
+        if p <= 10:   return 92
+        if p <= 20:   return 82
+        if p <= 35:   return 68
+        if p <= 55:   return 55
+        if p <= 75:   return 40
+        if p <= 90:   return 28
+        return 18
+
     def s_frame(c):
         if pd.isna(c): return MED
         return 100 if c >= 0.8 else 85 if c >= 0.5 else 70 if c >= 0.3 else 55 if c >= 0.1 else 40 if c >= 0 else 20
+
     def s_scale(s):
-        """与 screener.score_scale 保持一致: 钟形分段线性"""
         if pd.isna(s): return MED
         if s < 2:   return max(20.0, 30 + s / 2 * 30)
-        if s < 5:   return 60 + (s - 2) / 3 * 40       # 2→60, 5→100
-        if s <= 30: return 100                          # 甜区
-        if s <= 50: return 100 - (s - 30) / 20 * 15    # 30→100, 50→85
-        if s <= 100: return 85 - (s - 50) / 50 * 30   # 50→85, 100→55
-        if s <= 200: return 55 - (s - 100) / 100 * 25 # 100→55, 200→30
+        if s < 5:   return 60 + (s - 2) / 3 * 40
+        if s <= 30: return 100
+        if s <= 50: return 100 - (s - 30) / 20 * 15
+        if s <= 100: return 85 - (s - 50) / 50 * 30
+        if s <= 200: return 55 - (s - 100) / 100 * 25
         return 30
+
     def s_tenure(y):
-        """与 screener.score_tenure 保持一致: 分段线性, 边际递减"""
         if pd.isna(y): return MED
         if y < 3:    return max(20.0, 40 + y / 3 * 15)
-        if y < 5:    return 55 + (y - 3) / 2 * 17       # 3→55, 5→72
-        if y < 7:    return 72 + (y - 5) / 2 * 13       # 5→72, 7→85
-        if y < 10:   return 85 + (y - 7) / 3 * 10       # 7→85, 10→95
-        if y < 15:   return 95 + (y - 10) / 5 * 5       # 10→95, 15→100
+        if y < 5:    return 55 + (y - 3) / 2 * 17
+        if y < 7:    return 72 + (y - 5) / 2 * 13
+        if y < 10:   return 85 + (y - 7) / 3 * 10
+        if y < 15:   return 95 + (y - 10) / 5 * 5
         return 100
+
     def s_style_vol(v):
         if pd.isna(v): return MED
-        return 90 if v < 18 else 75 if v < 22 else 60 if v < 26 else 40
+        if v < 18:    return 88
+        if v < 22:    return 72
+        if v < 26:    return 55
+        if v < 30:    return 40
+        return 28
 
-    # 业绩排名分位: 候选池内近3年 PIT 收益的 0=最好,100=最差
     df = df.copy()
     df['业绩排名分位_PIT'] = (1 - df['近3年_PIT'].rank(ascending=True, pct=True, na_option='keep')) * 100
-
-    # 熊市分位 (低回撤=好)
     bear_pct = df['熊市平均回撤_PIT'].rank(ascending=True, pct=True, na_option='keep') * 100
+
     def s_bear(p, count):
         if pd.isna(p): return MED
-        base = 100 if p <= 20 else 82 if p <= 40 else 65 if p <= 60 else 45 if p <= 80 else 25
-        bonus = (min(count or 0, 3) - 1) * 2.5
+        if p <= 8:    base = 100
+        elif p <= 18: base = 90
+        elif p <= 35: base = 75
+        elif p <= 55: base = 60
+        elif p <= 75: base = 42
+        else:         base = 28
+        bonus = (min(count or 0, 3) - 1) * 2
         return float(min(100, max(0, base + bonus)))
 
     df['得分_稳定性'] = df['业绩排名分位_PIT'].apply(s_stab)
@@ -495,6 +513,94 @@ def run_backtest(as_of_date, hold_end_date=None, candidate_pool_size=None, top_n
 
 
 # ============================================================================
+# 滚动多窗口回测 (评分体系稳定性验证)
+# ============================================================================
+
+def run_rolling_backtest(offsets_months=None, hold_end_date=None,
+                        candidate_pool_size=None, top_n=None, max_universe=None):
+    """多起点滚动回测.
+    offsets_months: list of int, 每个值表示"运行时刻往前推 N 个月"作为 as_of_date.
+    返回 dict:
+        - per_window: list of summary, 每个起点一份
+        - aggregate: 跨窗口的均值/胜率
+        - top_n_per_window: list of DataFrame (每窗口的 Top N 持有期表现)
+    """
+    from .config import BACKTEST_ROLLING_OFFSETS_MONTHS
+    if offsets_months is None:
+        offsets_months = BACKTEST_ROLLING_OFFSETS_MONTHS
+    hold_end = pd.to_datetime(hold_end_date) if hold_end_date else pd.Timestamp.now().normalize()
+
+    logger.info('=' * 70)
+    logger.info(f'滚动回测启动: {len(offsets_months)} 个起点, offsets={offsets_months} 月, 持有至={hold_end.date()}')
+    logger.info('=' * 70)
+
+    per_window = []
+    top_n_per_window = []
+    for i, off in enumerate(offsets_months, 1):
+        as_of = (hold_end - pd.DateOffset(months=off)).normalize()
+        logger.info(f'\n[滚动 {i}/{len(offsets_months)}] as_of={as_of.date()} (T-{off}M)')
+        try:
+            r = run_backtest(
+                as_of_date=as_of,
+                hold_end_date=hold_end,
+                candidate_pool_size=candidate_pool_size,
+                top_n=top_n,
+                max_universe=max_universe,
+            )
+            if r is None:
+                logger.warning(f'  窗口 {as_of.date()} 回测失败, 跳过')
+                continue
+            per_window.append(r['summary'])
+            top_n_per_window.append(r['top_n'])
+        except Exception as e:
+            logger.warning(f'  窗口 {as_of.date()} 异常: {e}')
+
+    if not per_window:
+        logger.error('滚动回测: 所有窗口失败')
+        return None
+
+    # 聚合
+    def _avg(key):
+        vals = [s.get(key) for s in per_window if s.get(key) is not None]
+        return round(float(np.mean(vals)), 2) if vals else None
+
+    def _worst(key):
+        vals = [s.get(key) for s in per_window if s.get(key) is not None]
+        return round(float(min(vals)), 2) if vals else None
+
+    pool_alphas = [s.get('excess_top_vs_pool_avg') for s in per_window if s.get('excess_top_vs_pool_avg') is not None]
+    univ_alphas = [s.get('excess_top_vs_universe_avg') for s in per_window if s.get('excess_top_vs_universe_avg') is not None]
+    pos_pool = sum(1 for a in pool_alphas if a > 0)
+    pos_univ = sum(1 for a in univ_alphas if a > 0)
+
+    aggregate = {
+        'windows': len(per_window),
+        'hold_end': str(hold_end.date()),
+        'as_of_dates': [s.get('as_of') for s in per_window],
+        'avg_top_alpha_vs_pool': _avg('excess_top_vs_pool_avg'),
+        'avg_top_alpha_vs_universe': _avg('excess_top_vs_universe_avg'),
+        'worst_top_alpha_vs_pool': _worst('excess_top_vs_pool_avg'),
+        'worst_top_alpha_vs_universe': _worst('excess_top_vs_universe_avg'),
+        'positive_alpha_windows_vs_pool': f'{pos_pool}/{len(pool_alphas)}' if pool_alphas else '—',
+        'positive_alpha_windows_vs_universe': f'{pos_univ}/{len(univ_alphas)}' if univ_alphas else '—',
+        'avg_winrate_vs_pool_median': _avg('win_rate_vs_pool_median_pct'),
+        'avg_winrate_vs_universe_median': _avg('win_rate_vs_universe_median_pct'),
+    }
+
+    logger.info('\n' + '=' * 70)
+    logger.info('滚动回测聚合')
+    logger.info('=' * 70)
+    for k, v in aggregate.items():
+        logger.info(f'  {k}: {v}')
+
+    return {
+        'aggregate': aggregate,
+        'per_window': per_window,
+        'top_n_per_window': top_n_per_window,
+    }
+
+
+# ============================================================================
 # CLI
 # ============================================================================
 
@@ -509,13 +615,26 @@ def _write_excel(result, out_path):
     logger.info(f'已写出: {out_path}')
 
 
+def _write_excel_rolling(rolling, out_path):
+    os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+    with pd.ExcelWriter(out_path, engine='openpyxl') as writer:
+        pd.DataFrame([rolling['aggregate']]).T.rename(columns={0: 'value'}).to_excel(writer, sheet_name='aggregate')
+        if rolling['per_window']:
+            pd.DataFrame(rolling['per_window']).to_excel(writer, sheet_name='per_window', index=False)
+        for i, top_df in enumerate(rolling.get('top_n_per_window', []), 1):
+            top_df.drop(columns=['_nav_history', '_nav_holdout', '_composite'], errors='ignore') \
+                  .to_excel(writer, sheet_name=f'top_n_W{i}', index=False)
+    logger.info(f'已写出: {out_path}')
+
+
 def main():
     parser = argparse.ArgumentParser(description='Fund Screener — 回测验证')
-    parser.add_argument('--date', default='2024-01-01', help='回测起点 T (YYYY-MM-DD)')
+    parser.add_argument('--date', default=None, help='单点回测起点 T (YYYY-MM-DD), 与 --rolling 二选一')
+    parser.add_argument('--rolling', action='store_true', help='跑滚动多窗口回测 (默认使用 config 的 5 个起点)')
     parser.add_argument('--end', default=None, help='持有期结束 (YYYY-MM-DD), 默认今天')
     parser.add_argument('--pool-size', type=int, default=None, help='候选池规模, 默认从 config 取')
     parser.add_argument('--top-n', type=int, default=None, help='Top N, 默认从 config 取')
-    parser.add_argument('--max-universe', type=int, default=600, help='宇宙上限(避免给 3000+ 只都抓 NAV), 默认 600')
+    parser.add_argument('--max-universe', type=int, default=300, help='宇宙上限, 默认 300')
     parser.add_argument('--out', default='./output/backtest_result.xlsx', help='Excel 输出路径')
     args = parser.parse_args()
 
@@ -525,11 +644,24 @@ def main():
         handlers=[logging.StreamHandler(sys.stdout)],
     )
 
-    result = run_backtest(args.date, args.end, args.pool_size, args.top_n, args.max_universe)
-    if result is None:
-        logger.error('回测失败, 未生成结果')
-        sys.exit(1)
-    _write_excel(result, args.out)
+    if args.rolling or not args.date:
+        # 默认 (无 --date) 走滚动
+        rolling = run_rolling_backtest(
+            hold_end_date=args.end,
+            candidate_pool_size=args.pool_size,
+            top_n=args.top_n,
+            max_universe=args.max_universe,
+        )
+        if rolling is None:
+            logger.error('滚动回测失败')
+            sys.exit(1)
+        _write_excel_rolling(rolling, args.out)
+    else:
+        result = run_backtest(args.date, args.end, args.pool_size, args.top_n, args.max_universe)
+        if result is None:
+            logger.error('回测失败, 未生成结果')
+            sys.exit(1)
+        _write_excel(result, args.out)
 
 
 if __name__ == '__main__':

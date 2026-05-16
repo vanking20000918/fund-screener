@@ -45,10 +45,13 @@ def _find_col(df, *keywords):
 
 # 模块级缓存,供软评分阶段引用全市场参考数据
 _FULL_MARKET_REF = {
-    'rank_3y': None,    # 全市场近3年收益率(去 NaN), 用于 stability 全市场分位
-    'rank_1y': None,    # 兜底: 近1年收益分位
-    'rank_ytd': None,   # 兜底: 今年来收益分位
+    'rank_3y': None,    # 全市场近3年收益率(去 NaN), 用于 stability 全市场分位 (保留作 fallback)
+    'rank_1y': None,
+    'rank_ytd': None,
 }
+
+# 候选池合成指数 (按日期对齐的归一化 NAV 中位序列), 供熊市自动检测
+_POOL_INDEX_NAV = None
 
 
 def get_candidate_pool():
@@ -321,11 +324,11 @@ def _parse_tenure(val):
 
 
 def _compute_nav_metrics_one(code):
-    """单只基金: 拉净值 + 计算所有净值类指标. 线程安全, 返回 (result_dict, annual_rets_list)"""
+    """单只基金: 拉净值 + 计算所有净值类指标. 线程安全, 返回 (result_dict, annual_rets_list, normalized_nav_series)"""
     try:
         nav_df = df_module.fetch_fund_nav(code)
         if nav_df is None or len(nav_df) == 0:
-            return _empty_nav_metrics(code), []
+            return _empty_nav_metrics(code), [], None
 
         max_dd = metrics.calc_recent_drawdown(nav_df, years=3)
 
@@ -334,13 +337,13 @@ def _compute_nav_metrics_one(code):
         dates = pd.to_datetime(nav_df[date_col], errors='coerce')
         nav_values = pd.to_numeric(nav_df[nav_col], errors='coerce')
         valid = dates.notna() & nav_values.notna()
-        dates = dates[valid].values
-        nav_values = nav_values[valid].values
+        dates_arr = dates[valid].values
+        nav_values_arr = nav_values[valid].values
 
-        if len(nav_values) > 1:
-            annual_ret = metrics.calc_annual_return(nav_values, dates)
-            vol = metrics.calc_volatility(nav_values)
-            sharpe = metrics.calc_sharpe(nav_values, dates)
+        if len(nav_values_arr) > 1:
+            annual_ret = metrics.calc_annual_return(nav_values_arr, dates_arr)
+            vol = metrics.calc_volatility(nav_values_arr)
+            sharpe = metrics.calc_sharpe(nav_values_arr, dates_arr)
         else:
             annual_ret = vol = sharpe = np.nan
 
@@ -349,6 +352,12 @@ def _compute_nav_metrics_one(code):
         bear_dd_map = metrics.calc_bear_period_drawdown(nav_df)
         bear_avg_dd = metrics.calc_avg_bear_drawdown(bear_dd_map)
         annual_rets = metrics.calc_annual_returns_by_year(nav_df, years=5)
+
+        # 归一化 NAV 序列 (从首日 1.0 起算), 供合成候选池中位指数
+        norm_nav = None
+        if len(nav_values_arr) >= 30 and nav_values_arr[0] > 0:
+            norm_nav = pd.Series(nav_values_arr / nav_values_arr[0], index=pd.to_datetime(dates_arr))
+            norm_nav = norm_nav[~norm_nav.index.duplicated(keep='first')].sort_index()
 
         return {
             '基金代码': code,
@@ -360,10 +369,10 @@ def _compute_nav_metrics_one(code):
             '熊市数': bear_count,
             '熊市平均回撤': bear_avg_dd,
             '年度收益': annual_rets,
-        }, annual_rets
+        }, annual_rets, norm_nav
     except Exception as e:
         logger.warning(f'  基金 {code} 计算失败: {e}')
-        return _empty_nav_metrics(code), []
+        return _empty_nav_metrics(code), [], None
 
 
 def enrich_with_nav_metrics(candidate_df):
@@ -374,6 +383,7 @@ def enrich_with_nav_metrics(candidate_df):
 
     results = []
     annual_returns_pool = {}  # 候选池年度收益, 作为辅助参考
+    norm_navs = {}            # code -> normalized NAV Series, 用于合成候选池中位指数
     total = len(candidate_df)
     codes = candidate_df['基金代码'].tolist()
 
@@ -382,23 +392,45 @@ def enrich_with_nav_metrics(candidate_df):
     with ThreadPoolExecutor(max_workers=HTTP_WORKERS) as ex:
         future_to_code = {ex.submit(_compute_nav_metrics_one, c): c for c in codes}
         for fut in as_completed(future_to_code):
-            res, annual_rets = fut.result()
+            res, annual_rets, norm_nav = fut.result()
             results.append(res)
             # 主线程汇总, 无并发写竞争
             for y, r in annual_rets:
                 annual_returns_pool.setdefault(y, []).append(r)
+            if norm_nav is not None and len(norm_nav) >= 30:
+                norm_navs[res['基金代码']] = norm_nav
             completed += 1
             if completed % 50 == 0 or completed == total:
                 logger.info(f'  进度: {completed}/{total}')
 
+    # 合成候选池中位 NAV 指数 (按日期外连接 → 中位数), 供熊市自动检测
+    if norm_navs:
+        wide = pd.concat(norm_navs.values(), axis=1, join='outer')
+        global _POOL_INDEX_NAV
+        _POOL_INDEX_NAV = wide.median(axis=1).dropna()
+        logger.info(f'候选池中位 NAV 指数已合成: 长度={len(_POOL_INDEX_NAV)}, '
+                    f'日期范围={_POOL_INDEX_NAV.index.min().date()} → {_POOL_INDEX_NAV.index.max().date()}')
+
     metrics_df = pd.DataFrame(results)
     candidate_df = candidate_df.merge(metrics_df, on='基金代码', how='left')
 
-    # 业绩排名分位: 多层兜底 近3年→近1年→今年来→池内年度分位
-    logger.info('计算业绩排名分位 (多层兜底全市场参考)...')
+    # 业绩排名分位: 优先候选池内分位(0=最好,100=最差), 兜底全市场分位.
+    # 候选池本身已是全市场前 ~10%, 直接用全市场分位会把全员压到 100 分(评分饱和).
+    logger.info('计算业绩排名分位 (候选池内优先 + 全市场兜底)...')
     rank_3y_col = _find_col(candidate_df, '近3年')
     rank_1y_col = _find_col(candidate_df, '近1年')
     rank_ytd_col = _find_col(candidate_df, '今年来') or _find_col(candidate_df, '今年')
+
+    pool_rank_3y = pool_rank_1y = pool_rank_ytd = None
+    if rank_3y_col:
+        v = pd.to_numeric(candidate_df[rank_3y_col], errors='coerce')
+        pool_rank_3y = (1 - v.rank(ascending=True, pct=True, na_option='keep')) * 100
+    if rank_1y_col:
+        v = pd.to_numeric(candidate_df[rank_1y_col], errors='coerce')
+        pool_rank_1y = (1 - v.rank(ascending=True, pct=True, na_option='keep')) * 100
+    if rank_ytd_col:
+        v = pd.to_numeric(candidate_df[rank_ytd_col], errors='coerce')
+        pool_rank_ytd = (1 - v.rank(ascending=True, pct=True, na_option='keep')) * 100
 
     fallback_chain = [
         ('近3年', rank_3y_col, _FULL_MARKET_REF.get('rank_3y') or []),
@@ -406,22 +438,30 @@ def enrich_with_nav_metrics(candidate_df):
         ('今年来', rank_ytd_col, _FULL_MARKET_REF.get('rank_ytd') or []),
     ]
 
-    def _stability_percentile(row):
+    def _stability_percentile(idx, row):
+        # 优先: 候选池内近3年→近1年→今年来分位
+        for pool_pct in (pool_rank_3y, pool_rank_1y, pool_rank_ytd):
+            if pool_pct is not None:
+                p = pool_pct.get(idx)
+                if pd.notna(p):
+                    return p
+        # 兜底: 全市场分位
         for _label, col_name, ref in fallback_chain:
             if col_name and ref:
                 val = pd.to_numeric(row.get(col_name), errors='coerce')
                 p = metrics.calc_market_percentile(val, ref)
                 if pd.notna(p):
                     return p
-        # 最后回退到池内年度分位
         ar = row.get('年度收益', [])
         if ar:
             return metrics.calc_performance_rank_percentile(ar, annual_returns_pool)
         return np.nan
 
-    candidate_df['业绩排名分位'] = candidate_df.apply(_stability_percentile, axis=1)
+    candidate_df['业绩排名分位'] = [
+        _stability_percentile(idx, row) for idx, row in candidate_df.iterrows()
+    ]
     valid_n = candidate_df['业绩排名分位'].notna().sum()
-    logger.info(f'业绩排名分位有效数: {valid_n}/{len(candidate_df)}')
+    logger.info(f'业绩排名分位有效数 (候选池内): {valid_n}/{len(candidate_df)}')
     return candidate_df
 
 
@@ -669,18 +709,19 @@ def calc_soft_score(df):
     MEDIAN = 50
 
     def score_stability(percentile):
+        """业绩排名分位 → 得分 (评分卡 v2.1: 候选池内分位 + 阈值密化)
+        候选池本身是全市场前 ~10%, 进一步在池内排序;
+        阈值密化避免顶部全员 100, 让评分卡恢复区分度。"""
         if pd.isna(percentile):
             return MEDIAN
-        if percentile <= 10:
-            return 100
-        elif percentile <= 25:
-            return 88
-        elif percentile <= 50:
-            return 70
-        elif percentile <= 70:
-            return 50
-        else:
-            return 25
+        if percentile <= 5:    return 100
+        if percentile <= 10:   return 92
+        if percentile <= 20:   return 82
+        if percentile <= 35:   return 68
+        if percentile <= 55:   return 55
+        if percentile <= 75:   return 40
+        if percentile <= 90:   return 28
+        return 18
 
     def score_framework(calmar):
         # 卡玛比率 = 年化收益 / 最大回撤
@@ -738,40 +779,43 @@ def calc_soft_score(df):
             return 95 + (years - 10) / 5 * 5       # 10→95, 15→100
         return 100
 
-    # 风格一致性: 行业相似度优先, NaN 时回退波动率代理(eastmoney 场景)
-    def score_style_industry(sim):
-        if pd.isna(sim):
+    # 风格一致性: 候选池内行业相似度分位 (v2.1) → 阈值密化
+    # 主动基金 industry_similarity 普遍 0.85-1.0, 绝对阈值无区分度
+    sim_series = pd.to_numeric(df.get('行业稳定性'), errors='coerce')
+    valid_sim = sim_series.dropna()
+    if len(valid_sim) >= 10:
+        # rank 高 = 行业稳定 = 好 → 转成 0=最好,100=最差 的池内分位
+        style_pct = (1 - sim_series.rank(ascending=True, pct=True, na_option='keep')) * 100
+        df['_行业稳定性分位'] = style_pct
+    else:
+        df['_行业稳定性分位'] = np.nan
+
+    def score_style_industry_pool(pct):
+        if pd.isna(pct):
             return None
-        if sim >= 0.92:
-            return 100
-        elif sim >= 0.85:
-            return 85
-        elif sim >= 0.75:
-            return 70
-        elif sim >= 0.6:
-            return 55
-        else:
-            return 35
+        if pct <= 10:   return 100
+        if pct <= 25:   return 88
+        if pct <= 45:   return 72
+        if pct <= 65:   return 55
+        if pct <= 85:   return 40
+        return 22
 
     def score_style_volatility(vol):
         if pd.isna(vol):
             return MEDIAN
-        if vol < 18:
-            return 90
-        elif vol < 22:
-            return 75
-        elif vol < 26:
-            return 60
-        else:
-            return 40
+        if vol < 18:    return 88
+        if vol < 22:    return 72
+        if vol < 26:    return 55
+        if vol < 30:    return 40
+        return 28
 
     def score_style(row):
-        s = score_style_industry(row.get('行业稳定性'))
+        s = score_style_industry_pool(row.get('_行业稳定性分位'))
         if s is not None:
             return s
         return score_style_volatility(row.get('年化波动率'))
 
-    # 熊市相对表现: 候选池内对"熊市平均回撤"做分位
+    # 熊市相对表现: 候选池内对"熊市平均回撤"做分位 + 阈值密化
     bear_dd_series = pd.to_numeric(df['熊市平均回撤'], errors='coerce')
     valid_bear = bear_dd_series.dropna()
     if len(valid_bear) >= 5:
@@ -780,20 +824,17 @@ def calc_soft_score(df):
         df['熊市回撤分位'] = np.nan
 
     def score_bear_perf(percentile, bear_count):
+        """池内熊市回撤分位 → 得分 (v2.1 阈值密化)"""
         if pd.isna(percentile):
             return MEDIAN
-        if percentile <= 20:
-            base = 100
-        elif percentile <= 40:
-            base = 82
-        elif percentile <= 60:
-            base = 65
-        elif percentile <= 80:
-            base = 45
-        else:
-            base = 25
-        # 经历过更多熊市样本更可靠, 微调系数
-        bonus = (min(bear_count or 0, 3) - 1) * 2.5
+        if percentile <= 8:    base = 100
+        elif percentile <= 18: base = 90
+        elif percentile <= 35: base = 75
+        elif percentile <= 55: base = 60
+        elif percentile <= 75: base = 42
+        else:                  base = 28
+        # 经验加成弱化: 0/1/2/3 轮 → -2/0/2/4
+        bonus = (min(bear_count or 0, 3) - 1) * 2
         return float(min(100, max(0, base + bonus)))
 
     df['得分_稳定性'] = df['业绩排名分位'].apply(score_stability)
@@ -831,7 +872,9 @@ def calc_soft_score(df):
 
 def add_explanation(df):
     """
-    为每只基金生成"入选关键原因": Top3 贡献项 维度×分×权重
+    为每只基金生成人话版"入选关键原因".
+    优先用具体数字 (业绩排位/熊市抗跌/卡玛/任职), 取 2-3 个最强项。
+    fallback: 维度×分×权重 (评分卡机械版)
     """
     score_dim_to_weight = {
         '稳定性': SCORE_WEIGHTS['stability'],
@@ -842,7 +885,77 @@ def add_explanation(df):
         '规模': SCORE_WEIGHTS['scale'],
     }
 
-    def _explain(row):
+    def _humanize(row):
+        cards = []  # (priority_score, text) — priority 高的优先放在前面
+
+        # 业绩排名 (越小越好, 0=最好)
+        perf_pct = row.get('业绩排名分位')
+        score_stab = row.get('得分_稳定性', 50)
+        if pd.notna(perf_pct):
+            if perf_pct <= 10:
+                cards.append((score_stab + 20, f'近3年业绩排候选池前 {perf_pct:.0f}%'))
+            elif perf_pct <= 30:
+                cards.append((score_stab + 10, f'近3年业绩排候选池前 {perf_pct:.0f}%'))
+            elif perf_pct <= 60:
+                cards.append((score_stab, f'近3年业绩居候选池中游 ({perf_pct:.0f}% 分位)'))
+
+        # 熊市抗跌
+        bear_pct = row.get('熊市回撤分位')
+        bear_dd = row.get('熊市平均回撤')
+        bear_cnt = row.get('熊市数', 0)
+        score_bear = row.get('得分_熊市', 50)
+        if pd.notna(bear_dd) and pd.notna(bear_pct) and (bear_cnt or 0) >= 1:
+            cnt_int = int(bear_cnt)
+            if bear_pct <= 25:
+                cards.append((score_bear + 15,
+                              f'历 {cnt_int} 轮熊市平均仅回撤 {bear_dd:.1f}% (池内前 {bear_pct:.0f}%)'))
+            elif bear_pct <= 55:
+                cards.append((score_bear,
+                              f'历 {cnt_int} 轮熊市平均回撤 {bear_dd:.1f}% (池内 {bear_pct:.0f}% 分位)'))
+
+        # 卡玛
+        calmar = row.get('卡玛比率')
+        score_fr = row.get('得分_框架', 50)
+        if pd.notna(calmar):
+            if calmar >= 0.8:
+                cards.append((score_fr + 10, f'卡玛比 {calmar:.2f} 收益/回撤匹配优秀'))
+            elif calmar >= 0.5:
+                cards.append((score_fr, f'卡玛比 {calmar:.2f} 风险收益均衡'))
+            elif calmar >= 0.3:
+                cards.append((score_fr - 5, f'卡玛比 {calmar:.2f} 中等'))
+
+        # 任职
+        tenure = row.get('经理任职年限')
+        score_t = row.get('得分_任职', 50)
+        if pd.notna(tenure):
+            if tenure >= 10:
+                cards.append((score_t + 8, f'经理任职 {tenure:.0f} 年, 完整周期老将'))
+            elif tenure >= 7:
+                cards.append((score_t, f'经理任职 {tenure:.0f} 年, 跨多轮市场'))
+            elif tenure >= 5:
+                cards.append((score_t - 3, f'经理任职 {tenure:.0f} 年'))
+
+        # 规模
+        scale = row.get('基金规模')
+        score_sc = row.get('得分_规模', 50)
+        if pd.notna(scale):
+            if 5 <= scale <= 30:
+                cards.append((score_sc - 10, f'规模 {scale:.1f} 亿 调仓灵活'))
+            elif 30 < scale <= 60:
+                cards.append((score_sc - 15, f'规模 {scale:.1f} 亿 偏大'))
+
+        # 行业稳定性 (主动管理稳定度)
+        ind_sim = row.get('行业稳定性')
+        score_st = row.get('得分_风格', 50)
+        if pd.notna(ind_sim) and ind_sim >= 0.95 and score_st >= 70:
+            cards.append((score_st - 10, f'近2年行业配置稳定度 {ind_sim:.2f}'))
+
+        # 取 priority 最高的 2-3 张卡片
+        cards.sort(reverse=True)
+        if cards:
+            return '; '.join(c[1] for c in cards[:3])
+
+        # fallback: 机械版
         contributions = []
         for dim, w in score_dim_to_weight.items():
             score = row.get(f'得分_{dim}')
@@ -853,8 +966,38 @@ def add_explanation(df):
         return ' | '.join(f'{d}{s:.0f}×{w:.2f}' for d, s, w, _ in top3)
 
     df = df.copy()
-    df['入选原因'] = df.apply(_explain, axis=1)
+    df['入选原因'] = df.apply(_humanize, axis=1)
     return df
+
+
+def _auto_detect_bear_markets_if_enabled():
+    """基于候选池中位 NAV 自动检测熊市段, 与 config.BEAR_MARKETS 对比给出建议.
+    仅日志输出建议, 不会改变本次评分 (确保回测可复现)."""
+    from .config import BEAR_DETECT_PARAMS, BEAR_MARKETS as CONF_BEAR
+    if not BEAR_DETECT_PARAMS.get('enable', False):
+        return
+    if _POOL_INDEX_NAV is None or len(_POOL_INDEX_NAV) < 60:
+        logger.info('候选池中位 NAV 不足, 跳过熊市自动检测')
+        return
+    try:
+        detected = metrics.detect_bear_markets(_POOL_INDEX_NAV, BEAR_DETECT_PARAMS)
+        new_segs = metrics.diff_bear_markets(
+            detected, CONF_BEAR,
+            overlap_days=BEAR_DETECT_PARAMS.get('recovery_overlap_days', 30),
+        )
+        if detected:
+            logger.info(f'候选池中位 NAV 自动检测到 {len(detected)} 段熊市:')
+            for s, e, dd in detected:
+                logger.info(f'  {s} → {e} 回撤 {dd:.1f}%')
+        if new_segs:
+            logger.warning('=' * 60)
+            logger.warning(f'⚠️  发现 {len(new_segs)} 段未在 config.BEAR_MARKETS 中的新熊市:')
+            for s, e, dd in new_segs:
+                logger.warning(f"    ('{s}', '{e}'),    # 自动检测, 池内回撤 {dd:.1f}%")
+            logger.warning('如确认有效, 请把上述行追加到 src/config.py BEAR_MARKETS 列表')
+            logger.warning('=' * 60)
+    except Exception as e:
+        logger.warning(f'熊市自动检测失败 (不影响月度评分): {e}')
 
 
 def run_screening():
@@ -875,6 +1018,12 @@ def run_screening():
     candidate = enrich_with_industry(candidate, only_passed=True)
     candidate = calc_soft_score(candidate)
     candidate = add_explanation(candidate)
+
+    # 熊市自动检测 (基于候选池中位 NAV)
+    _auto_detect_bear_markets_if_enabled()
+
+    # 清理临时分位列
+    candidate = candidate.drop(columns=['_行业稳定性分位'], errors='ignore')
 
     # 排序
     passed = candidate[candidate['硬筛通过']].copy()
