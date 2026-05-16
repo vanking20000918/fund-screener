@@ -40,13 +40,28 @@ def main():
         if len(top_n_df) == 0:
             logger.warning('未筛选出任何基金,仍发送空报告')
 
+        # 1B. 跑滚动 18 个月回测做评分体系验证 (失败降级, 不阻塞月度邮件)
+        backtest_result = None
+        try:
+            import pandas as pd
+            from src.backtest import run_backtest
+            as_of = (pd.Timestamp.now() - pd.DateOffset(months=18)).normalize()
+            logger.info(f'开始评分体系回测验证: as_of={as_of.date()}, 持有至今...')
+            backtest_result = run_backtest(
+                as_of_date=as_of, hold_end_date=None,
+                candidate_pool_size=100, top_n=20, max_universe=300,
+            )
+        except Exception as bt_e:
+            logger.warning(f'回测失败, 报告将不含回测板块: {bt_e}')
+            backtest_result = None
+
         # 2. 生成 HTML 报告
-        html = generate_html_report(top_n_df, all_df)
+        html = generate_html_report(top_n_df, all_df, backtest=backtest_result)
 
         # 3. 生成 Excel 附件
         date_str = datetime.now().strftime('%Y%m%d')
         excel_path = os.path.join(OUTPUT_DIR, f'基金筛选报告_{date_str}.xlsx')
-        generate_excel_report(top_n_df, all_df, excel_path)
+        generate_excel_report(top_n_df, all_df, excel_path, backtest=backtest_result)
 
         # 4. 发送邮件
         subject = f'📊 基金月度筛选报告 - {datetime.now().strftime("%Y年%m月")}'

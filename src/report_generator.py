@@ -117,6 +117,8 @@ HTML_TEMPLATE = """
         </tbody>
     </table>
 
+    {backtest_section}
+
     <div class="warning-box">
         <strong>⚠️ 重要提醒</strong><br>
         • 本报告基于历史数据回测,<strong>过去业绩不代表未来表现</strong>。<br>
@@ -156,6 +158,72 @@ def _fmt(val, fmt='{:.2f}', default='—'):
         return str(val)
 
 
+def _fmt_pct(v):
+    """带正负号的百分点格式化, 用于超额收益等带符号场景"""
+    if v is None or pd.isna(v):
+        return '—'
+    return f'{v:+.2f}'
+
+
+def _build_backtest_html(backtest):
+    """构造 HTML 邮件里的回测验证区块. backtest 为 None 时返回空串"""
+    if not backtest or 'summary' not in backtest:
+        return ''
+    s = backtest['summary']
+
+    def _v(key, fmt='{:.2f}'):
+        val = s.get(key)
+        if val is None or pd.isna(val):
+            return '—'
+        try:
+            return fmt.format(val)
+        except (ValueError, TypeError):
+            return str(val)
+
+    return f"""
+    <h2>🔬 评分体系回测验证</h2>
+    <p class="small">PIT 回测: 用 <strong>{s.get('as_of', '—')}</strong> 时点的评分体系挑 Top {s.get('top_n_size', '—')},
+    持有至 <strong>{s.get('hold_end', '—')}</strong> ({s.get('hold_days', '—')} 天)。
+    宇宙规模 {s.get('pool_universe_size', '—')} 只,硬筛通过 {s.get('pool_passed_hard_filter', '—')} 只。</p>
+    <table>
+        <thead>
+            <tr>
+                <th>口径</th>
+                <th>Top {s.get('top_n_size', 'N')}</th>
+                <th>通过硬筛池子</th>
+                <th>整宇宙</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>平均持有期收益(%)</td>
+                <td class="score">{_v('top_n_avg_return_pct')}</td>
+                <td>{_v('pool_passed_avg_return_pct')}</td>
+                <td>{_v('universe_avg_return_pct')}</td>
+            </tr>
+            <tr>
+                <td>中位数(%)</td>
+                <td>{_v('top_n_median_return_pct')}</td>
+                <td>{_v('pool_passed_median_return_pct')}</td>
+                <td>{_v('universe_median_return_pct')}</td>
+            </tr>
+            <tr>
+                <td>Top 超额(pct)</td>
+                <td colspan="2">vs 池子: <strong>{_fmt_pct(s.get('excess_top_vs_pool_avg'))}</strong></td>
+                <td>vs 宇宙: <strong>{_fmt_pct(s.get('excess_top_vs_universe_avg'))}</strong></td>
+            </tr>
+            <tr>
+                <td>Top 胜率 vs 中位数(%)</td>
+                <td colspan="2">vs 池子: {_v('win_rate_vs_pool_median_pct', '{:.1f}')}</td>
+                <td>vs 宇宙: {_v('win_rate_vs_universe_median_pct', '{:.1f}')}</td>
+            </tr>
+        </tbody>
+    </table>
+    <p class="small">说明: 回测使用历史时点的净值数据 (PIT) 重跑评分,持有期收益反映"若当时按本评分体系选 Top N,持有至今的实际表现"。
+    宇宙存活者偏差不可避免;规模/在管基金数用当前值代理,有已知偏差。</p>
+    """
+
+
 def _fmt_bear_dd(row):
     """熊市平均回撤显示: NaN 且熊市数=0 时显示'未经历熊市',否则显示'—'"""
     dd = row.get('熊市平均回撤')
@@ -167,8 +235,8 @@ def _fmt_bear_dd(row):
     return '未经历熊市' if int(bc) == 0 else '—'
 
 
-def generate_html_report(top_n_df, all_df):
-    """生成 HTML 邮件正文"""
+def generate_html_report(top_n_df, all_df, backtest=None):
+    """生成 HTML 邮件正文. backtest: src.backtest.run_backtest 返回值, 可选"""
     if len(top_n_df) == 0:
         return _generate_empty_report(all_df)
 
@@ -243,6 +311,7 @@ def generate_html_report(top_n_df, all_df):
         top_rows=''.join(top_rows),
         detail_rows=''.join(detail_rows),
         score_rows=''.join(score_rows),
+        backtest_section=_build_backtest_html(backtest),
     )
     return html
 
@@ -265,8 +334,9 @@ def _generate_empty_report(all_df):
 # ============================================================================
 # Excel 详细报告
 # ============================================================================
-def generate_excel_report(top_n_df, all_df, output_path):
-    """生成 Excel 详细附件"""
+def generate_excel_report(top_n_df, all_df, output_path, backtest=None):
+    """生成 Excel 详细附件. backtest: src.backtest.run_backtest 返回值, 可选,
+    存在时新增 "回测验证" sheet"""
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     wb = Workbook()
@@ -461,6 +531,101 @@ def generate_excel_report(top_n_df, all_df, output_path):
     ws_rule.column_dimensions['B'].width = 22
     ws_rule.column_dimensions['C'].width = 35
     ws_rule.column_dimensions['D'].width = 22
+
+    # ========== Sheet 4: 回测验证 (仅当传入 backtest 时) ==========
+    if backtest and 'summary' in backtest:
+        ws_bt = wb.create_sheet('回测验证')
+        s = backtest['summary']
+
+        ws_bt.merge_cells('A1:D1')
+        ws_bt['A1'] = '评分体系回测验证 (PIT)'
+        ws_bt['A1'].font = F_TITLE
+        ws_bt['A1'].fill = FILL_TITLE
+        ws_bt['A1'].alignment = ALIGN_C
+        ws_bt.row_dimensions[1].height = 28
+
+        ws_bt.merge_cells('A2:D2')
+        ws_bt['A2'] = (
+            f"回测起点 T = {s.get('as_of', '—')}, 持有至 {s.get('hold_end', '—')} "
+            f"({s.get('hold_days', '—')} 天), "
+            f"宇宙 {s.get('pool_universe_size', '—')} 只, "
+            f"硬筛通过 {s.get('pool_passed_hard_filter', '—')} 只"
+        )
+        ws_bt['A2'].font = Font(name='微软雅黑', size=10, italic=True, color='595959')
+        ws_bt['A2'].alignment = ALIGN_L
+
+        # Summary 表
+        bt_rows = [
+            ('指标', 'Top N', '通过硬筛池子', '整宇宙'),
+            ('平均持有期收益 (%)',
+                s.get('top_n_avg_return_pct'),
+                s.get('pool_passed_avg_return_pct'),
+                s.get('universe_avg_return_pct')),
+            ('中位数 (%)',
+                s.get('top_n_median_return_pct'),
+                s.get('pool_passed_median_return_pct'),
+                s.get('universe_median_return_pct')),
+            ('Top 超额 (pct)',
+                None,
+                f"vs 池子: {s.get('excess_top_vs_pool_avg', '—')}",
+                f"vs 宇宙: {s.get('excess_top_vs_universe_avg', '—')}"),
+            ('Top 胜率 vs 中位数 (%)',
+                None,
+                f"vs 池子: {s.get('win_rate_vs_pool_median_pct', '—')}",
+                f"vs 宇宙: {s.get('win_rate_vs_universe_median_pct', '—')}"),
+        ]
+
+        for i, row_data in enumerate(bt_rows, start=4):
+            for j, val in enumerate(row_data, 1):
+                c = ws_bt.cell(row=i, column=j, value=val if val is not None else '')
+                if i == 4:
+                    c.font = F_HEADER
+                    c.fill = FILL_HEADER
+                else:
+                    c.font = F_BODY
+                c.alignment = ALIGN_C
+                c.border = BORDER
+                if i > 4 and j > 1 and isinstance(val, (int, float)):
+                    c.number_format = '0.00'
+
+        # Top N 持有期收益明细
+        top_bt = backtest.get('top_n')
+        if top_bt is not None and len(top_bt) > 0:
+            start_row = 4 + len(bt_rows) + 2
+            ws_bt.merge_cells(f'A{start_row}:D{start_row}')
+            ws_bt.cell(row=start_row, column=1, value='Top N 持有期收益明细').font = Font(
+                name='微软雅黑', size=11, bold=True, color='1F4E78'
+            )
+            ws_bt.cell(row=start_row, column=1).fill = PatternFill('solid', start_color='D9E1F2')
+            ws_bt.cell(row=start_row, column=1).alignment = ALIGN_C
+
+            headers_bt = ['排名', '基金代码', '基金简称', '持有期收益 (%)']
+            for j, h in enumerate(headers_bt, 1):
+                c = ws_bt.cell(row=start_row + 1, column=j, value=h)
+                c.font = F_HEADER
+                c.fill = FILL_HEADER
+                c.alignment = ALIGN_C
+                c.border = BORDER
+
+            for i, (_, r) in enumerate(top_bt.iterrows(), start=1):
+                ws_bt.cell(row=start_row + 1 + i, column=1, value=i)
+                ws_bt.cell(row=start_row + 1 + i, column=2, value=r.get('基金代码', ''))
+                ws_bt.cell(row=start_row + 1 + i, column=3, value=r.get('基金简称', ''))
+                ret = r.get('持有期收益')
+                ws_bt.cell(row=start_row + 1 + i, column=4,
+                           value=float(ret) if pd.notna(ret) else '')
+                for j in range(1, 5):
+                    cell = ws_bt.cell(row=start_row + 1 + i, column=j)
+                    cell.font = F_BODY
+                    cell.alignment = ALIGN_C if j != 3 else ALIGN_L
+                    cell.border = BORDER
+                    if j == 4 and pd.notna(ret):
+                        cell.number_format = '0.00'
+
+        ws_bt.column_dimensions['A'].width = 24
+        ws_bt.column_dimensions['B'].width = 20
+        ws_bt.column_dimensions['C'].width = 30
+        ws_bt.column_dimensions['D'].width = 22
 
     wb.save(output_path)
     logger.info(f'Excel 报告已保存: {output_path}')
