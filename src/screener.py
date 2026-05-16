@@ -10,6 +10,7 @@
 """
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import numpy as np
@@ -19,6 +20,9 @@ from .config import (
     DATA_SOURCE, FUND_TYPES, HARD_FILTER, SCORE_WEIGHTS, TOP_N, PERF_CONFIG, POOL_RANK_WEIGHTS
 )
 from . import metrics
+
+# 并发抓取工作线程数(与 data_fetcher_eastmoney.HTTP_WORKERS 对齐)
+HTTP_WORKERS = 8
 
 # 根据配置选择数据源
 if DATA_SOURCE == 'eastmoney':
@@ -316,69 +320,76 @@ def _parse_tenure(val):
         return np.nan
 
 
+def _compute_nav_metrics_one(code):
+    """单只基金: 拉净值 + 计算所有净值类指标. 线程安全, 返回 (result_dict, annual_rets_list)"""
+    try:
+        nav_df = df_module.fetch_fund_nav(code)
+        if nav_df is None or len(nav_df) == 0:
+            return _empty_nav_metrics(code), []
+
+        max_dd = metrics.calc_recent_drawdown(nav_df, years=3)
+
+        date_col = '净值日期' if '净值日期' in nav_df.columns else nav_df.columns[0]
+        nav_col = '单位净值' if '单位净值' in nav_df.columns else nav_df.columns[1]
+        dates = pd.to_datetime(nav_df[date_col], errors='coerce')
+        nav_values = pd.to_numeric(nav_df[nav_col], errors='coerce')
+        valid = dates.notna() & nav_values.notna()
+        dates = dates[valid].values
+        nav_values = nav_values[valid].values
+
+        if len(nav_values) > 1:
+            annual_ret = metrics.calc_annual_return(nav_values, dates)
+            vol = metrics.calc_volatility(nav_values)
+            sharpe = metrics.calc_sharpe(nav_values, dates)
+        else:
+            annual_ret = vol = sharpe = np.nan
+
+        calmar = metrics.calc_calmar(annual_ret, max_dd)
+        bear_count = metrics.calc_bear_market_count(nav_df)
+        bear_dd_map = metrics.calc_bear_period_drawdown(nav_df)
+        bear_avg_dd = metrics.calc_avg_bear_drawdown(bear_dd_map)
+        annual_rets = metrics.calc_annual_returns_by_year(nav_df, years=5)
+
+        return {
+            '基金代码': code,
+            '近3年最大回撤': max_dd if max_dd and max_dd > 0 else np.nan,
+            '年化收益率': annual_ret,
+            '年化波动率': vol,
+            '夏普比率': sharpe,
+            '卡玛比率': calmar,
+            '熊市数': bear_count,
+            '熊市平均回撤': bear_avg_dd,
+            '年度收益': annual_rets,
+        }, annual_rets
+    except Exception as e:
+        logger.warning(f'  基金 {code} 计算失败: {e}')
+        return _empty_nav_metrics(code), []
+
+
 def enrich_with_nav_metrics(candidate_df):
-    """第三步: 对候选池每只基金计算净值类指标(回撤/收益/夏普/卡玛/熊市表现)"""
+    """第三步: 对候选池每只基金计算净值类指标(回撤/收益/夏普/卡玛/熊市表现), 并发抓取"""
     logger.info('=' * 60)
     logger.info('Step 3: 计算净值类指标(回撤、收益、卡玛、熊市表现)')
     logger.info('=' * 60)
 
     results = []
     annual_returns_pool = {}  # 候选池年度收益, 作为辅助参考
-
     total = len(candidate_df)
-    rows = list(candidate_df.iterrows())
-    for i, (_, row) in enumerate(rows):
-        code = row['基金代码']
-        try:
-            nav_df = df_module.fetch_fund_nav(code)
-            if nav_df is None or len(nav_df) == 0:
-                results.append(_empty_nav_metrics(code))
-                continue
+    codes = candidate_df['基金代码'].tolist()
 
-            max_dd = metrics.calc_recent_drawdown(nav_df, years=3)
-
-            date_col = '净值日期' if '净值日期' in nav_df.columns else nav_df.columns[0]
-            nav_col = '单位净值' if '单位净值' in nav_df.columns else nav_df.columns[1]
-            dates = pd.to_datetime(nav_df[date_col], errors='coerce')
-            nav_values = pd.to_numeric(nav_df[nav_col], errors='coerce')
-            valid = dates.notna() & nav_values.notna()
-            dates = dates[valid].values
-            nav_values = nav_values[valid].values
-
-            if len(nav_values) > 1:
-                annual_ret = metrics.calc_annual_return(nav_values, dates)
-                vol = metrics.calc_volatility(nav_values)
-                sharpe = metrics.calc_sharpe(nav_values, dates)
-            else:
-                annual_ret = vol = sharpe = np.nan
-
-            calmar = metrics.calc_calmar(annual_ret, max_dd)
-            bear_count = metrics.calc_bear_market_count(nav_df)
-            bear_dd_map = metrics.calc_bear_period_drawdown(nav_df)
-            bear_avg_dd = metrics.calc_avg_bear_drawdown(bear_dd_map)
-            annual_rets = metrics.calc_annual_returns_by_year(nav_df, years=5)
-
+    logger.info(f'并发抓取净值 (workers={HTTP_WORKERS}), 共 {total} 只...')
+    completed = 0
+    with ThreadPoolExecutor(max_workers=HTTP_WORKERS) as ex:
+        future_to_code = {ex.submit(_compute_nav_metrics_one, c): c for c in codes}
+        for fut in as_completed(future_to_code):
+            res, annual_rets = fut.result()
+            results.append(res)
+            # 主线程汇总, 无并发写竞争
             for y, r in annual_rets:
                 annual_returns_pool.setdefault(y, []).append(r)
-
-            results.append({
-                '基金代码': code,
-                '近3年最大回撤': max_dd if max_dd and max_dd > 0 else np.nan,
-                '年化收益率': annual_ret,
-                '年化波动率': vol,
-                '夏普比率': sharpe,
-                '卡玛比率': calmar,
-                '熊市数': bear_count,
-                '熊市平均回撤': bear_avg_dd,
-                '年度收益': annual_rets,
-            })
-
-            if (i + 1) % 20 == 0:
-                logger.info(f'  进度: {i+1}/{total}')
-
-        except Exception as e:
-            logger.warning(f'  基金 {code} 计算失败: {e}')
-            results.append(_empty_nav_metrics(code))
+            completed += 1
+            if completed % 50 == 0 or completed == total:
+                logger.info(f'  进度: {completed}/{total}')
 
     metrics_df = pd.DataFrame(results)
     candidate_df = candidate_df.merge(metrics_df, on='基金代码', how='left')
@@ -459,26 +470,32 @@ def enrich_with_industry(candidate_df, only_passed=True):
         logger.info('无目标基金, 跳过行业配置抓取')
         return candidate_df
 
-    sims = {}
-    fetched = 0
-    failed = 0
-    for idx, row in candidate_df[target_mask].iterrows():
-        code = row['基金代码']
+    def _industry_one(idx, code):
         try:
             allocs = df_module.fetch_recent_industry_allocations(code, years=2)
             sim = metrics.calc_industry_similarity(allocs) if allocs else np.nan
-            if not pd.isna(sim):
-                fetched += 1
-            else:
-                failed += 1
         except Exception as e:
             logger.debug(f'  基金 {code} 行业稳定性计算失败: {e}')
             sim = np.nan
-            failed += 1
-        sims[idx] = sim
+        return idx, sim
 
-        if (fetched + failed) % 20 == 0:
-            logger.info(f'  进度: {fetched + failed}/{n_target} (成功={fetched}, 失败={failed})')
+    targets = [(idx, row['基金代码']) for idx, row in candidate_df[target_mask].iterrows()]
+    sims = {}
+    fetched = 0
+    failed = 0
+    logger.info(f'并发抓取行业配置 (workers={HTTP_WORKERS}), 共 {n_target} 只...')
+    with ThreadPoolExecutor(max_workers=HTTP_WORKERS) as ex:
+        futures = [ex.submit(_industry_one, idx, code) for idx, code in targets]
+        for fut in as_completed(futures):
+            idx, sim = fut.result()
+            sims[idx] = sim
+            if pd.isna(sim):
+                failed += 1
+            else:
+                fetched += 1
+            done = fetched + failed
+            if done % 20 == 0 or done == n_target:
+                logger.info(f'  进度: {done}/{n_target} (成功={fetched}, 失败={failed})')
 
     candidate_df.loc[list(sims.keys()), '行业稳定性'] = pd.Series(sims)
     logger.info(f'行业稳定性最终完整度: 成功={fetched}, 失败={failed}, 跳过={len(candidate_df) - n_target}')

@@ -8,6 +8,7 @@ import json
 import time
 import pickle
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from functools import wraps
 
@@ -15,6 +16,11 @@ import requests
 import pandas as pd
 
 from .config import CACHE_DIR, CACHE_DAYS_RANK, CACHE_DAYS_NAV, PERF_CONFIG
+
+# 并发抓取详情/净值的工作线程数(eastmoney 单机限速宽松, 8 安全)
+HTTP_WORKERS = 8
+# 详情/净值/单只基金 HTTP 超时(秒): 失败基金需快速放弃避免拖累整批
+DETAIL_TIMEOUT = 8
 
 logger = logging.getLogger(__name__)
 
@@ -210,7 +216,7 @@ def fetch_fund_nav(code):
     time.sleep(PERF_CONFIG['request_delay'])
 
     url = f'https://fund.eastmoney.com/pingzhongdata/{code}.js'
-    resp = requests.get(url, headers=HEADERS, timeout=30)
+    resp = requests.get(url, headers=HEADERS, timeout=DETAIL_TIMEOUT)
     resp.raise_for_status()
     text = resp.text
 
@@ -259,7 +265,7 @@ def fetch_fund_detail(code):
     # 1. 基金经理页: jjjl_CODE.html
     try:
         url = f'https://fundf10.eastmoney.com/jjjl_{code}.html'
-        resp = requests.get(url, headers=NAV_HEADERS, timeout=30)
+        resp = requests.get(url, headers=NAV_HEADERS, timeout=DETAIL_TIMEOUT)
         resp.encoding = 'utf-8'
         html = resp.text
 
@@ -290,7 +296,7 @@ def fetch_fund_detail(code):
     try:
         time.sleep(PERF_CONFIG['request_delay'] * 0.5)
         url2 = f'https://fundf10.eastmoney.com/jbgk_{code}.html'
-        resp2 = requests.get(url2, headers=NAV_HEADERS, timeout=30)
+        resp2 = requests.get(url2, headers=NAV_HEADERS, timeout=DETAIL_TIMEOUT)
         resp2.encoding = 'utf-8'
         html2 = resp2.text
 
@@ -311,15 +317,24 @@ def fetch_fund_detail(code):
 
 
 def fetch_fund_details_batch(codes):
-    """批量获取基金详情(经理、规模、成立日期)"""
-    logger.info(f'[天天基金] 批量获取基金详情, 共 {len(codes)} 只...')
+    """批量获取基金详情(经理、规模、成立日期), 并发抓取"""
+    total = len(codes)
+    logger.info(f'[天天基金] 并发批量获取基金详情 (workers={HTTP_WORKERS}), 共 {total} 只...')
     results = []
-    for i, code in enumerate(codes):
-        detail = fetch_fund_detail(code)
-        if detail:
-            results.append(detail)
-        if (i + 1) % 30 == 0:
-            logger.info(f'  详情进度: {i+1}/{len(codes)}')
+    completed = 0
+    with ThreadPoolExecutor(max_workers=HTTP_WORKERS) as ex:
+        future_to_code = {ex.submit(fetch_fund_detail, c): c for c in codes}
+        for fut in as_completed(future_to_code):
+            code = future_to_code[fut]
+            try:
+                detail = fut.result()
+                if detail:
+                    results.append(detail)
+            except Exception as e:
+                logger.warning(f'基金 {code} 详情抓取异常: {e}')
+            completed += 1
+            if completed % 50 == 0 or completed == total:
+                logger.info(f'  详情进度: {completed}/{total}')
     return pd.DataFrame(results) if results else pd.DataFrame()
 
 
